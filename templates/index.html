@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GST Reconciliation Demo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <span class="eyebrow">Reconciliation demo</span>
+      <h1>Match purchase records with GSTR-2B</h1>
+      <p>Drop one Purchase Register and one GSTR-2B file. CSV and XLSX are supported.</p>
+    </header>
+
+    {% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}
+
+    <form action="{{ url_for('reconcile_uploads') }}" method="post" enctype="multipart/form-data" id="upload-form">
+      <div class="drop-grid">
+        <label class="drop-zone">
+          <input type="file" name="pr_file" accept=".csv,.xlsx" required>
+          <span class="drop-icon">PR</span>
+          <strong>Purchase Register</strong>
+          <small>Drop file here or click to browse</small>
+          <span class="file-name">No file selected</span>
+        </label>
+        <label class="drop-zone">
+          <input type="file" name="gstr2b_file" accept=".csv,.xlsx" required>
+          <span class="drop-icon">2B</span>
+          <strong>GSTR-2B</strong>
+          <small>Drop file here or click to browse</small>
+          <span class="file-name">No file selected</span>
+        </label>
+      </div>
+      <button class="primary" type="submit">Run reconciliation</button>
+    </form>
+
+    {% if job_id %}
+      <section class="results">
+        <div class="result-heading">
+          <div><span class="eyebrow">Output 01</span><h2>Purchase Register</h2></div>
+          <a class="export" href="{{ url_for('export', job_id=job_id, kind='pr') }}">Export XLSX</a>
+        </div>
+        {% with table=pr, kind='pr' %}{% include '_table.html' %}{% endwith %}
+      </section>
+
+      <section class="results">
+        <div class="result-heading">
+          <div><span class="eyebrow">Output 02</span><h2>GSTR-2B</h2></div>
+          <a class="export" href="{{ url_for('export', job_id=job_id, kind='gstr2b') }}">Export XLSX</a>
+        </div>
+        {% with table=gstr2b, kind='gstr2b' %}{% include '_table.html' %}{% endwith %}
+      </section>
+    {% endif %}
+  </main>
+
+  <script>
+    document.querySelectorAll('.drop-zone').forEach((zone) => {
+      const input = zone.querySelector('input');
+      const name = zone.querySelector('.file-name');
+      const sync = () => {
+        name.textContent = input.files[0]?.name || 'No file selected';
+        zone.classList.toggle('has-file', input.files.length > 0);
+      };
+      input.addEventListener('change', sync);
+      ['dragenter', 'dragover'].forEach((event) => zone.addEventListener(event, () => zone.classList.add('dragging')));
+      ['dragleave', 'drop'].forEach((event) => zone.addEventListener(event, () => zone.classList.remove('dragging')));
+    });
+    document.getElementById('upload-form').addEventListener('submit', (event) => {
+      const button = event.currentTarget.querySelector('button');
+      button.disabled = true;
+      button.textContent = 'Reconciling…';
+    });
+  </script>
+</body>
+</html>

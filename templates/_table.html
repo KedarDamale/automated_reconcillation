@@ -1,0 +1,23 @@
+<div class="table-meta">{{ table.total }} rows · Page {{ table.page }} of {{ table.pages }}</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead>
+    <tbody>
+      {% for row in table.rows %}
+        <tr>{% for column in table.columns %}<td>{{ row[column] if row[column] is not none else '—' }}</td>{% endfor %}</tr>
+      {% else %}
+        <tr><td class="empty">No rows found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if table.pages > 1 %}
+  <nav class="pagination" aria-label="{{ kind }} pagination">
+    {% if table.page > 1 %}
+      <a href="{{ url_for('results', job_id=job_id, pr_page=(table.page - 1) if kind == 'pr' else pr.page, gstr2b_page=(table.page - 1) if kind == 'gstr2b' else gstr2b.page) }}">← Previous</a>
+    {% else %}<span></span>{% endif %}
+    {% if table.page < table.pages %}
+      <a href="{{ url_for('results', job_id=job_id, pr_page=(table.page + 1) if kind == 'pr' else pr.page, gstr2b_page=(table.page + 1) if kind == 'gstr2b' else gstr2b.page) }}">Next →</a>
+    {% endif %}
+  </nav>
+{% endif %}
