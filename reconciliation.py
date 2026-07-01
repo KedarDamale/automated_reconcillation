@@ -8,7 +8,6 @@ from pathlib import Path
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-
 PREFERRED_COLUMNS = [
     "Supplier Name",
     "GSTIN",
@@ -38,13 +37,22 @@ def handle_multitype_import(file_path: str | Path) -> pd.DataFrame:
         if extension == ".xlsx":
             return pd.read_excel(file_path)
     except Exception as exc:
-        raise ReconciliationInputError(f"Could not read {Path(file_path).name}: {exc}") from exc
+        raise ReconciliationInputError(
+            f"Could not read {Path(file_path).name}: {exc}"
+        ) from exc
 
     raise ReconciliationInputError("Only .csv and .xlsx files are supported.")
 
 
 def normalize_col_names(column_name: object) -> str:
-    return str(column_name).lower().strip().replace("_", " ").replace("-", " ").replace(".", "")
+    return (
+        str(column_name)
+        .lower()
+        .strip()
+        .replace("_", " ")
+        .replace("-", " ")
+        .replace(".", "")
+    )
 
 
 def extract_preferred_columns_from_df(
@@ -200,7 +208,8 @@ def reconcile(
     for pur_index, row in pur.iterrows():
         candidates = twob[
             (twob["GSTIN"] == row["GSTIN"])
-            & (twob["Invoice Date"] == row["Invoice Date"])
+            & (twob["Invoice Date"] - row["Invoice Date"]).abs()
+            <= pd.Timedelta(days=10)
             & (
                 abs(twob["Taxable Value"] - row["Taxable Value"])
                 <= numeric_tolerance * max(row["Taxable Value"], 1)
@@ -221,9 +230,7 @@ def reconcile(
 
             score = 0.5 * fuzz.WRatio(
                 row["Supplier Name"], candidate["Supplier Name"]
-            ) + 0.5 * fuzz.WRatio(
-                str(row["Invoice No"]), str(candidate["Invoice No"])
-            )
+            ) + 0.5 * fuzz.WRatio(str(row["Invoice No"]), str(candidate["Invoice No"]))
 
             if score > best_score:
                 best_score = score
