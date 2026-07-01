@@ -205,11 +205,17 @@ def reconcile(
 
     matched_2b_indexes = set()
 
+    twob_invoice_dates = pd.to_datetime(
+        twob["Invoice Date"], format="%Y%m%d", errors="coerce"
+    )
+
     for pur_index, row in pur.iterrows():
+        row_invoice_date = pd.to_datetime(
+            row["Invoice Date"], format="%Y%m%d", errors="coerce"
+        )
         candidates = twob[
             (twob["GSTIN"] == row["GSTIN"])
-            & (twob["Invoice Date"] - row["Invoice Date"]).abs()
-            <= pd.Timedelta(days=10)
+            & ((twob_invoice_dates - row_invoice_date).abs() <= pd.Timedelta(days=10))
             & (
                 abs(twob["Taxable Value"] - row["Taxable Value"])
                 <= numeric_tolerance * max(row["Taxable Value"], 1)
