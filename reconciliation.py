@@ -209,15 +209,32 @@ def reconcile(
         twob["Invoice Date"], format="%Y%m%d", errors="coerce"
     )
 
+    # Pre-split GSTR-2B rows by GSTIN once so each Purchase Register row only
+    # scans the rows that could plausibly match it, instead of re-masking the
+    # entire GSTR-2B table on every iteration (that O(n*m) scan was slow
+    # enough on real-sized uploads to trip the web server's request timeout).
+    twob_by_gstin = {gstin: group for gstin, group in twob.groupby("GSTIN", sort=False)}
+    twob_missing_gstin = twob[twob["GSTIN"].isna()]
+
     for pur_index, row in pur.iterrows():
+        if pd.isna(row["GSTIN"]):
+            candidate_pool = twob_missing_gstin
+        else:
+            candidate_pool = twob_by_gstin.get(row["GSTIN"])
+            if candidate_pool is None:
+                continue
+
+        if candidate_pool.empty:
+            continue
+
         row_invoice_date = pd.to_datetime(
             row["Invoice Date"], format="%Y%m%d", errors="coerce"
         )
-        candidates = twob[
-            (twob["GSTIN"] == row["GSTIN"])
-            & ((twob_invoice_dates - row_invoice_date).abs() <= pd.Timedelta(days=10))
+        pool_dates = twob_invoice_dates.loc[candidate_pool.index]
+        candidates = candidate_pool[
+            ((pool_dates - row_invoice_date).abs() <= pd.Timedelta(days=10))
             & (
-                abs(twob["Taxable Value"] - row["Taxable Value"])
+                abs(candidate_pool["Taxable Value"] - row["Taxable Value"])
                 <= numeric_tolerance * max(row["Taxable Value"], 1)
             )
         ]
