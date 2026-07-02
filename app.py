@@ -48,12 +48,8 @@ def create_app() -> Flask:
             gstr2b_file.save(gstr2b_path)
 
             pr_result, gstr2b_result = run_reconciliation(pr_path, gstr2b_path)
-            _save_result(pr_result, job_dir / "pr_reconciled.xlsx", job_dir / "pr_result.json")
-            _save_result(
-                gstr2b_result,
-                job_dir / "gstr2b_reconciled.xlsx",
-                job_dir / "gstr2b_result.json",
-            )
+            _save_result(pr_result, job_dir / "pr_result.json")
+            _save_result(gstr2b_result, job_dir / "gstr2b_result.json")
         except ReconciliationInputError as exc:
             if "job_dir" in locals():
                 _remove_job(job_dir)
@@ -88,16 +84,19 @@ def create_app() -> Flask:
 
     @app.get("/export/<job_id>/<kind>")
     def export(job_id: str, kind: str):
-        filenames = {
-            "pr": "pr_reconciled.xlsx",
-            "gstr2b": "gstr2b_reconciled.xlsx",
+        names = {
+            "pr": ("pr_reconciled.xlsx", "pr_result.json"),
+            "gstr2b": ("gstr2b_reconciled.xlsx", "gstr2b_result.json"),
         }
-        if kind not in filenames:
+        if kind not in names:
             abort(404)
-        result_path = _job_dir(app, job_id) / filenames[kind]
-        if not result_path.is_file():
-            abort(404)
-        return send_file(result_path, as_attachment=True, download_name=filenames[kind])
+        excel_name, json_name = names[kind]
+        job_dir = _job_dir(app, job_id)
+        excel_path = job_dir / excel_name
+        if not excel_path.is_file():
+            rows = _load_rows(job_dir / json_name)
+            pd.DataFrame(rows).to_excel(excel_path)
+        return send_file(excel_path, as_attachment=True, download_name=excel_name)
 
     @app.errorhandler(413)
     def file_too_large(_error):
@@ -114,10 +113,7 @@ def _validate_upload(upload, label: str) -> None:
         raise ReconciliationInputError(f"{label} must be a .csv or .xlsx file.")
 
 
-def _save_result(dataframe: pd.DataFrame, excel_path: Path, json_path: Path) -> None:
-    # Keep the dataframe index in the workbook, as the notebook does, because the
-    # match columns refer to these row indexes.
-    dataframe.to_excel(excel_path)
+def _save_result(dataframe: pd.DataFrame, json_path: Path) -> None:
     json_path.write_text(
         dataframe.to_json(orient="records", date_format="iso"),
         encoding="utf-8",
