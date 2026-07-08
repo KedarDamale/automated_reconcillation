@@ -33,6 +33,35 @@
           <span class="file-name">No file selected</span>
         </label>
       </div>
+
+      <input type="hidden" name="pr_mapping" id="pr_mapping">
+      <input type="hidden" name="gstr2b_mapping" id="gstr2b_mapping">
+
+      <div class="mapping-grid">
+        <div class="mapping-panel" id="pr-mapping-panel" hidden>
+          <div class="mapping-panel-head">
+            <strong>Match columns · Purchase Register</strong>
+            <span class="mapping-hint">We matched what we could — review and fix the rest.</span>
+          </div>
+          <div class="mapping-rows" id="pr-mapping-rows"></div>
+          <div class="mapping-error" id="pr-mapping-error" hidden></div>
+        </div>
+        <div class="mapping-panel" id="gstr2b-mapping-panel" hidden>
+          <div class="mapping-panel-head">
+            <strong>Match columns · GSTR-2B</strong>
+            <span class="mapping-hint">We matched what we could — review and fix the rest.</span>
+          </div>
+          <div class="mapping-rows" id="gstr2b-mapping-rows"></div>
+          <div class="mapping-error" id="gstr2b-mapping-error" hidden></div>
+        </div>
+      </div>
+
+      <div class="tolerance-control">
+        <label for="date-tolerance">Invoice date match tolerance</label>
+        <input type="range" id="date-tolerance" name="date_tolerance_days" min="0" max="60" value="10">
+        <output for="date-tolerance" id="date-tolerance-output">± 10 days</output>
+      </div>
+
       <button class="primary" type="submit">Run reconciliation</button>
     </form>
 
@@ -67,7 +96,207 @@
       ['dragenter', 'dragover'].forEach((event) => zone.addEventListener(event, () => zone.classList.add('dragging')));
       ['dragleave', 'drop'].forEach((event) => zone.addEventListener(event, () => zone.classList.remove('dragging')));
     });
+
+    const AUTO_MATCH_THRESHOLD = 95;
+
+    const PANELS = {
+      pr: {
+        fileInput: document.querySelector('input[name="pr_file"]'),
+        panel: document.getElementById('pr-mapping-panel'),
+        rows: document.getElementById('pr-mapping-rows'),
+        errorEl: document.getElementById('pr-mapping-error'),
+        hiddenInput: document.getElementById('pr_mapping'),
+        state: null,
+      },
+      gstr2b: {
+        fileInput: document.querySelector('input[name="gstr2b_file"]'),
+        panel: document.getElementById('gstr2b-mapping-panel'),
+        rows: document.getElementById('gstr2b-mapping-rows'),
+        errorEl: document.getElementById('gstr2b-mapping-error'),
+        hiddenInput: document.getElementById('gstr2b_mapping'),
+        state: null,
+      },
+    };
+
+    function showMappingError(ctx, message) {
+      ctx.errorEl.textContent = message;
+      ctx.errorEl.hidden = false;
+    }
+
+    function hideMappingError(ctx) {
+      ctx.errorEl.hidden = true;
+    }
+
+    function updateStatusBadge(entry) {
+      const { statusBadge, value, suggestion, isRequired } = entry;
+      statusBadge.className = 'mapping-badge';
+      if (!value) {
+        statusBadge.classList.add(isRequired ? 'mapping-badge--missing' : 'mapping-badge--optional');
+        statusBadge.textContent = isRequired ? 'Needs a column' : 'Optional — skipped';
+        return;
+      }
+      if (suggestion.source === value && suggestion.score >= AUTO_MATCH_THRESHOLD) {
+        statusBadge.classList.add('mapping-badge--auto');
+        statusBadge.textContent = `Auto-matched · ${Math.round(suggestion.score)}%`;
+      } else {
+        statusBadge.classList.add('mapping-badge--manual');
+        statusBadge.textContent = 'Selected';
+      }
+    }
+
+    function syncHiddenMapping(ctx) {
+      if (!ctx.state) {
+        ctx.hiddenInput.value = '';
+        return;
+      }
+      const mapping = {};
+      Object.entries(ctx.state.entries).forEach(([preferred, entry]) => {
+        mapping[preferred] = entry.value || null;
+      });
+      ctx.hiddenInput.value = JSON.stringify(mapping);
+    }
+
+    function handleMappingChange(preferred, ctx) {
+      const entries = ctx.state.entries;
+      const entry = entries[preferred];
+      const newValue = entry.select.value;
+      const oldValue = entry.value;
+
+      if (newValue) {
+        // Swap: if another field already claimed this column, hand it our old value
+        // instead so the two rows "swoop" past each other without ever colliding.
+        const collision = Object.entries(entries).find(
+          ([otherPreferred, otherEntry]) => otherPreferred !== preferred && otherEntry.value === newValue
+        );
+        if (collision) {
+          const [, otherEntry] = collision;
+          otherEntry.select.value = oldValue;
+          otherEntry.value = oldValue;
+          updateStatusBadge(otherEntry);
+        }
+      }
+
+      entry.value = newValue;
+      updateStatusBadge(entry);
+      hideMappingError(ctx);
+      syncHiddenMapping(ctx);
+    }
+
+    function renderMappingPanel(ctx, data) {
+      ctx.rows.innerHTML = '';
+      hideMappingError(ctx);
+      const entries = {};
+
+      data.preferred_columns.forEach((preferred) => {
+        const suggestion = data.suggestions[preferred] || { source: null, score: 0 };
+        const isRequired = data.required_columns.includes(preferred);
+        const initialValue = suggestion.source || '';
+
+        const row = document.createElement('div');
+        row.className = 'mapping-row';
+
+        const label = document.createElement('span');
+        label.className = 'mapping-preferred';
+        label.textContent = preferred;
+        if (isRequired) {
+          const requiredBadge = document.createElement('span');
+          requiredBadge.className = 'required-badge';
+          requiredBadge.textContent = 'Required';
+          label.appendChild(requiredBadge);
+        }
+
+        const select = document.createElement('select');
+        select.className = 'mapping-select';
+        const blankOption = document.createElement('option');
+        blankOption.value = '';
+        blankOption.textContent = '— Not mapped —';
+        select.appendChild(blankOption);
+        data.columns.forEach((column) => {
+          const option = document.createElement('option');
+          option.value = column;
+          option.textContent = column;
+          select.appendChild(option);
+        });
+        select.value = initialValue;
+
+        const statusBadge = document.createElement('span');
+
+        const entry = { select, statusBadge, isRequired, suggestion, value: initialValue };
+        entries[preferred] = entry;
+        updateStatusBadge(entry);
+
+        select.addEventListener('change', () => handleMappingChange(preferred, ctx));
+
+        row.append(label, select, statusBadge);
+        ctx.rows.appendChild(row);
+      });
+
+      ctx.state = { entries };
+      ctx.panel.hidden = false;
+      syncHiddenMapping(ctx);
+    }
+
+    async function loadColumnPreview(ctx) {
+      const file = ctx.fileInput.files[0];
+      ctx.state = null;
+      ctx.hiddenInput.value = '';
+      ctx.panel.hidden = true;
+      hideMappingError(ctx);
+      if (!file) return;
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      let data;
+      try {
+        const response = await fetch('{{ url_for("preview_columns") }}', { method: 'POST', body: formData });
+        data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not read that file.');
+      } catch (err) {
+        ctx.panel.hidden = false;
+        ctx.rows.innerHTML = '';
+        showMappingError(
+          ctx,
+          `Couldn't preview columns (${err.message}). Reconciliation will still try to match columns automatically.`
+        );
+        return;
+      }
+
+      renderMappingPanel(ctx, data);
+    }
+
+    Object.values(PANELS).forEach((ctx) => {
+      ctx.fileInput.addEventListener('change', () => loadColumnPreview(ctx));
+    });
+
+    const toleranceInput = document.getElementById('date-tolerance');
+    const toleranceOutput = document.getElementById('date-tolerance-output');
+    const syncTolerance = () => {
+      toleranceOutput.textContent = `± ${toleranceInput.value} day${toleranceInput.value === '1' ? '' : 's'}`;
+    };
+    toleranceInput.addEventListener('input', syncTolerance);
+    syncTolerance();
+
     document.getElementById('upload-form').addEventListener('submit', (event) => {
+      let valid = true;
+
+      Object.values(PANELS).forEach((ctx) => {
+        if (!ctx.state) return; // preview never loaded; backend falls back to automatic matching
+        hideMappingError(ctx);
+        const missing = Object.entries(ctx.state.entries)
+          .filter(([, entry]) => entry.isRequired && !entry.value)
+          .map(([preferred]) => preferred);
+        if (missing.length) {
+          valid = false;
+          showMappingError(ctx, `Map a column for: ${missing.join(', ')} before running reconciliation.`);
+        }
+      });
+
+      if (!valid) {
+        event.preventDefault();
+        return;
+      }
+
       const button = event.currentTarget.querySelector('button');
       button.disabled = true;
       button.textContent = 'Reconciling…';

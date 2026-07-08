@@ -75,6 +75,137 @@ class ReconciliationAppTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn(b"must be a .csv or .xlsx file", response.data)
 
+    def test_columns_preview_returns_fuzzy_matched_suggestions(self):
+        response = self.client.post(
+            "/columns",
+            data={"file": (csv_upload("INV", 1), "purchase.csv")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn("GSTIN", payload["columns"])
+        self.assertEqual(payload["suggestions"]["Supplier Name"]["source"], "Supplier Name")
+        self.assertGreaterEqual(payload["suggestions"]["Supplier Name"]["score"], 95)
+        self.assertIn("Taxable Value", payload["required_columns"])
+
+    def test_columns_preview_rejects_wrong_extension(self):
+        response = self.client.post(
+            "/columns",
+            data={"file": (io.BytesIO(b"bad"), "purchase.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("must be a .csv or .xlsx file", response.get_json()["error"])
+
+    def test_reconcile_honors_a_user_confirmed_column_mapping(self):
+        pr_csv = io.BytesIO(
+            b"supplier,gst_no,inv_no,inv_date,hsn,taxable,igst,cgst,sgst,total\n"
+            b"Acme Supplier,22AAAAA0000A1Z5,INV-1,01/06/2026,1001,1000,0,90,90,180\n"
+        )
+        pr_mapping = json.dumps(
+            {
+                "Supplier Name": "supplier",
+                "GSTIN": "gst_no",
+                "Invoice No": "inv_no",
+                "Invoice Date": "inv_date",
+                "Taxable Value": "taxable",
+            }
+        )
+
+        response = self.client.post(
+            "/reconcile",
+            data={
+                "pr_file": (pr_csv, "purchase.csv"),
+                "gstr2b_file": (csv_upload("INV", 1), "gstr2b.csv"),
+                "pr_mapping": pr_mapping,
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        job_id = response.headers["Location"].rstrip("/").split("/")[-1]
+        pr_rows = json.loads(
+            (Path(self.temp_dir.name) / job_id / "pr_result.json").read_text("utf-8")
+        )
+        # These headers ("supplier", "gst_no", ...) don't fuzzy-match the
+        # preferred schema, so a populated "Supplier Name" proves the
+        # confirmed mapping -- not automatic matching -- was used.
+        self.assertEqual(pr_rows[0]["Supplier Name"], "acme supplier")
+
+    def test_reconcile_rejects_a_mapping_pointing_at_a_missing_column(self):
+        pr_mapping = json.dumps(
+            {
+                "Supplier Name": "does-not-exist",
+                "GSTIN": "GSTIN",
+                "Invoice No": "Invoice No",
+                "Invoice Date": "Invoice Date",
+                "Taxable Value": "Taxable Value",
+            }
+        )
+
+        response = self.client.post(
+            "/reconcile",
+            data={
+                "pr_file": (csv_upload("INV", 1), "purchase.csv"),
+                "gstr2b_file": (csv_upload("INV", 1), "gstr2b.csv"),
+                "pr_mapping": pr_mapping,
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"does-not-exist", response.data)
+
+    def test_reconcile_rejects_a_mapping_that_reuses_a_source_column(self):
+        pr_mapping = json.dumps(
+            {
+                "Supplier Name": "GSTIN",
+                "GSTIN": "GSTIN",
+                "Invoice No": "Invoice No",
+                "Invoice Date": "Invoice Date",
+                "Taxable Value": "Taxable Value",
+            }
+        )
+
+        response = self.client.post(
+            "/reconcile",
+            data={
+                "pr_file": (csv_upload("INV", 1), "purchase.csv"),
+                "gstr2b_file": (csv_upload("INV", 1), "gstr2b.csv"),
+                "pr_mapping": pr_mapping,
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"mapped once", response.data)
+
+    def test_reconcile_respects_custom_date_tolerance_days(self):
+        pr = io.BytesIO(
+            (COLUMNS + "Acme Supplier,22AAAAA0000A1Z5,INV-1,01/06/2026,1001,1000,0,90,90,180").encode()
+        )
+        gstr2b = io.BytesIO(
+            (COLUMNS + "Acme Supplier,22AAAAA0000A1Z5,INV-1,12/06/2026,1001,1000,0,90,90,180").encode()
+        )
+
+        response = self.client.post(
+            "/reconcile",
+            data={
+                "pr_file": (pr, "purchase.csv"),
+                "gstr2b_file": (gstr2b, "gstr2b.csv"),
+                "date_tolerance_days": "15",
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        job_id = response.headers["Location"].rstrip("/").split("/")[-1]
+        pr_rows = json.loads(
+            (Path(self.temp_dir.name) / job_id / "pr_result.json").read_text("utf-8")
+        )
+        # 11 days apart: default 10-day tolerance would leave this unmatched.
+        self.assertEqual(pr_rows[0]["Best match 2B index"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

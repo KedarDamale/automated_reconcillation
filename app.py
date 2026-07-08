@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import uuid
 from pathlib import Path
 
@@ -10,7 +9,17 @@ import pandas as pd
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
 from werkzeug.utils import secure_filename
 
-from reconciliation import ReconciliationInputError, run_reconciliation
+from reconciliation import (
+    DEFAULT_DATE_TOLERANCE_DAYS,
+    MAX_DATE_TOLERANCE_DAYS,
+    MIN_DATE_TOLERANCE_DAYS,
+    PREFERRED_COLUMNS,
+    REQUIRED_COLUMNS,
+    ReconciliationInputError,
+    read_uploaded_columns,
+    run_reconciliation,
+    suggest_column_mapping,
+)
 
 
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
@@ -29,6 +38,22 @@ def create_app() -> Flask:
     def index():
         return render_template("index.html")
 
+    @app.post("/columns")
+    def preview_columns():
+        upload = request.files.get("file")
+        try:
+            _validate_upload(upload, "File")
+            columns = read_uploaded_columns(upload, upload.filename)
+        except ReconciliationInputError as exc:
+            return {"error": str(exc)}, 400
+
+        return {
+            "columns": columns,
+            "preferred_columns": PREFERRED_COLUMNS,
+            "required_columns": REQUIRED_COLUMNS,
+            "suggestions": suggest_column_mapping(columns, PREFERRED_COLUMNS),
+        }
+
     @app.post("/reconcile")
     def reconcile_uploads():
         pr_file = request.files.get("pr_file")
@@ -37,6 +62,9 @@ def create_app() -> Flask:
         try:
             _validate_upload(pr_file, "Purchase Register")
             _validate_upload(gstr2b_file, "GSTR-2B")
+            pr_mapping = _parse_mapping(request.form.get("pr_mapping"), "Purchase Register")
+            gstr2b_mapping = _parse_mapping(request.form.get("gstr2b_mapping"), "GSTR-2B")
+            date_tolerance_days = _parse_date_tolerance(request.form.get("date_tolerance_days"))
 
             job_id = uuid.uuid4().hex
             job_dir = app.config["JOBS_DIR"] / job_id
@@ -47,7 +75,13 @@ def create_app() -> Flask:
             pr_file.save(pr_path)
             gstr2b_file.save(gstr2b_path)
 
-            pr_result, gstr2b_result = run_reconciliation(pr_path, gstr2b_path)
+            pr_result, gstr2b_result = run_reconciliation(
+                pr_path,
+                gstr2b_path,
+                pr_mapping=pr_mapping,
+                gstr2b_mapping=gstr2b_mapping,
+                date_tolerance_days=date_tolerance_days,
+            )
             _save_result(pr_result, job_dir / "pr_result.json")
             _save_result(gstr2b_result, job_dir / "gstr2b_result.json")
         except ReconciliationInputError as exc:
@@ -111,6 +145,34 @@ def _validate_upload(upload, label: str) -> None:
     extension = Path(secure_filename(upload.filename)).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         raise ReconciliationInputError(f"{label} must be a .csv or .xlsx file.")
+
+
+def _parse_mapping(raw: str | None, label: str) -> dict | None:
+    """Parse a user-confirmed column mapping submitted alongside a file.
+
+    Absent entirely, this signals "no mapping was confirmed" (e.g. JS
+    disabled, or the column-preview call failed) and reconciliation falls
+    back to automatic fuzzy matching. Present but malformed is treated as a
+    tampered/broken request and rejected immediately, same as any other
+    invalid input.
+    """
+    if not raw:
+        return None
+    try:
+        mapping = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ReconciliationInputError(f"{label} column mapping was malformed.") from exc
+    if not isinstance(mapping, dict):
+        raise ReconciliationInputError(f"{label} column mapping was malformed.")
+    return mapping
+
+
+def _parse_date_tolerance(raw: str | None) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_DATE_TOLERANCE_DAYS
+    return min(max(value, MIN_DATE_TOLERANCE_DAYS), MAX_DATE_TOLERANCE_DAYS)
 
 
 def _save_result(dataframe: pd.DataFrame, json_path: Path) -> None:
