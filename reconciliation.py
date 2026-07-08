@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
+
+logger = logging.getLogger(__name__)
 
 PREFERRED_COLUMNS = [
     "Supplier Name",
@@ -59,7 +64,9 @@ def read_uploaded_columns(file, filename: str) -> list[str]:
         if extension == ".csv":
             return list(pd.read_csv(file, nrows=0).columns)
         if extension == ".xlsx":
-            return list(pd.read_excel(file, nrows=0).columns)
+            return list(
+                pd.read_excel(file, nrows=0, engine_kwargs={"read_only": True}).columns
+            )
     except Exception as exc:
         raise ReconciliationInputError(f"Could not read {filename}: {exc}") from exc
 
@@ -350,22 +357,33 @@ def reconcile(
         if candidates.empty:
             continue
 
+        candidate_indexes = candidates.index.tolist()
+
+        supplier_scores = process.cdist(
+            [row["Supplier Name"]],
+            candidates["Supplier Name"].tolist(),
+            scorer=fuzz.WRatio,
+            dtype=np.float64,
+        )[0]
+        invoice_scores = process.cdist(
+            [str(row["Invoice No"])],
+            [str(value) for value in candidates["Invoice No"].tolist()],
+            scorer=fuzz.WRatio,
+            dtype=np.float64,
+        )[0]
+        scores = 0.5 * supplier_scores + 0.5 * invoice_scores
+
+        eligible = np.array(
+            [candidate_index not in matched_2b_indexes for candidate_index in candidate_indexes]
+        )
+        eligible_scores = np.where(eligible, scores, -1.0)
+
         best_score = 0
         best_candidate_index = None
-        candidate_indexes = []
-
-        for candidate_index, candidate in candidates.iterrows():
-            candidate_indexes.append(candidate_index)
-            if candidate_index in matched_2b_indexes:
-                continue
-
-            score = 0.5 * fuzz.WRatio(
-                row["Supplier Name"], candidate["Supplier Name"]
-            ) + 0.5 * fuzz.WRatio(str(row["Invoice No"]), str(candidate["Invoice No"]))
-
-            if score > best_score:
-                best_score = score
-                best_candidate_index = candidate_index
+        if eligible_scores.size and eligible_scores.max() > 0:
+            best_position = int(np.argmax(eligible_scores))
+            best_score = float(eligible_scores[best_position])
+            best_candidate_index = candidate_indexes[best_position]
 
         if best_candidate_index is not None and best_score >= similarity_threshold:
             pur.at[pur_index, "Best score"] = best_score
@@ -395,4 +413,21 @@ def run_reconciliation(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     purchase_register = prepare_dataframe(pr_path, "Purchase Register", pr_mapping)
     gstr2b = prepare_dataframe(gstr2b_path, "GSTR-2B", gstr2b_mapping)
-    return reconcile(purchase_register, gstr2b, date_tolerance_days=date_tolerance_days)
+
+    logger.info(
+        "reconciliation starting: pr_rows=%d gstr2b_rows=%d date_tolerance_days=%d",
+        len(purchase_register), len(gstr2b), date_tolerance_days,
+    )
+    start = time.perf_counter()
+    pur_result, gstr2b_result = reconcile(
+        purchase_register, gstr2b, date_tolerance_days=date_tolerance_days
+    )
+    elapsed = time.perf_counter() - start
+
+    matched = int(pur_result["Best match 2B index"].notna().sum())
+    probable_only = int(pur_result["Probable 2B indexes"].notna().sum())
+    logger.info(
+        "reconciliation finished: pr_rows=%d gstr2b_rows=%d matched=%d probable_only=%d elapsed=%.2fs",
+        len(purchase_register), len(gstr2b), matched, probable_only, elapsed,
+    )
+    return pur_result, gstr2b_result

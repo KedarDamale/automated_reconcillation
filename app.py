@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
 from pathlib import Path
@@ -21,6 +22,9 @@ from reconciliation import (
     suggest_column_mapping,
 )
 
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 PAGE_SIZE = 10
