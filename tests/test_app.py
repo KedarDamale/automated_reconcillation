@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from openpyxl import load_workbook
+
 from app import create_app
+from workbook_export import SHEET_NAMES
 
 
 COLUMNS = (
@@ -50,11 +53,19 @@ class ReconciliationAppTest(unittest.TestCase):
         self.assertIn(b"Page 1 of 2", page.data)
 
         job_id = result_url.rstrip("/").split("/")[-1]
-        for kind in ("pr", "gstr2b"):
-            export = self.client.get(f"/export/{job_id}/{kind}")
-            self.assertEqual(export.status_code, 200)
-            self.assertGreater(len(export.data), 1000)
-            export.close()
+        export = self.client.get(f"/export/{job_id}")
+        self.assertEqual(export.status_code, 200)
+        self.assertGreater(len(export.data), 1000)
+        workbook = load_workbook(io.BytesIO(export.data))
+        self.assertEqual(workbook.sheetnames, SHEET_NAMES)
+        matched = workbook["4 Matched Entries"]
+        self.assertEqual(matched["L2"].value, "Match Score")
+        self.assertEqual(matched["L3"].value, 100)
+        self.assertEqual(matched["L3"].border.left.style, "thick")
+        self.assertEqual(matched["L3"].border.right.style, "thick")
+        export.close()
+
+        self.assertEqual(self.client.get(f"/export/{job_id}/pr").status_code, 404)
 
         pr_rows = json.loads(
             (Path(self.temp_dir.name) / job_id / "pr_result.json").read_text("utf-8")
@@ -131,6 +142,39 @@ class ReconciliationAppTest(unittest.TestCase):
         # preferred schema, so a populated "Supplier Name" proves the
         # confirmed mapping -- not automatic matching -- was used.
         self.assertEqual(pr_rows[0]["Supplier Name"], "acme supplier")
+
+    def test_reconcile_sums_multiple_taxable_value_columns_from_mapping(self):
+        pr_csv = io.BytesIO(
+            b"supplier,gst_no,inv_no,inv_date,taxable_base,taxable_adjustment\n"
+            b"Acme Supplier,22AAAAA0000A1Z5,INV-1,01/06/2026,900,100\n"
+        )
+        pr_mapping = json.dumps(
+            {
+                "Supplier Name": "supplier",
+                "GSTIN": "gst_no",
+                "Invoice No": "inv_no",
+                "Invoice Date": "inv_date",
+                "Taxable Value": ["taxable_base", "taxable_adjustment"],
+            }
+        )
+
+        response = self.client.post(
+            "/reconcile",
+            data={
+                "pr_file": (pr_csv, "purchase.csv"),
+                "gstr2b_file": (csv_upload("INV", 1), "gstr2b.csv"),
+                "pr_mapping": pr_mapping,
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        job_id = response.headers["Location"].rstrip("/").split("/")[-1]
+        pr_rows = json.loads(
+            (Path(self.temp_dir.name) / job_id / "pr_result.json").read_text("utf-8")
+        )
+        self.assertEqual(pr_rows[0]["Taxable Value"], 1000)
+        self.assertEqual(pr_rows[0]["Best match 2B index"], 0)
 
     def test_reconcile_rejects_a_mapping_pointing_at_a_missing_column(self):
         pr_mapping = json.dumps(

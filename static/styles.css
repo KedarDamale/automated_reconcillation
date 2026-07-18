@@ -19,7 +19,7 @@ header { max-width: 760px; margin-bottom: 32px; }
 h1 { max-width: 680px; margin: 10px 0 12px; font-size: clamp(2.2rem, 6vw, 4.6rem); line-height: .98; letter-spacing: -.055em; }
 h2 { margin: 5px 0 0; font-size: 1.5rem; letter-spacing: -.03em; }
 p { color: var(--muted); font-size: 1.04rem; line-height: 1.6; }
-form, .results { padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--paper); box-shadow: 0 16px 44px rgba(30, 54, 47, .06); }
+form, .results, .workbook-download { padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--paper); box-shadow: 0 16px 44px rgba(30, 54, 47, .06); }
 .drop-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
 .drop-zone { display: flex; min-height: 220px; padding: 28px; align-items: center; justify-content: center; flex-direction: column; border: 1.5px dashed #acbbb5; border-radius: 13px; background: #fafcf9; cursor: pointer; transition: .18s ease; text-align: center; }
 .drop-zone:hover, .drop-zone.dragging { border-color: var(--accent); background: #f0faf6; transform: translateY(-2px); }
@@ -37,8 +37,12 @@ form, .results { padding: 24px; border: 1px solid var(--line); border-radius: 18
 .mapping-rows { display: flex; flex-direction: column; gap: 8px; }
 .mapping-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: center; }
 .mapping-preferred { display: flex; align-items: center; gap: 6px; font-size: .84rem; font-weight: 700; }
+.mapping-taxable-hint { color: var(--muted); font-size: .69rem; font-weight: 500; line-height: 1.3; }
 .required-badge { padding: 2px 6px; border-radius: 5px; color: #8e2c20; background: #fff1ef; font-size: .64rem; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
 .mapping-select { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; background: white; font: inherit; font-size: .82rem; }
+.mapping-checkboxes { display: grid; max-height: 154px; overflow-y: auto; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+.mapping-checkbox { display: flex; min-width: 0; align-items: center; gap: 6px; color: var(--ink); font-size: .78rem; overflow-wrap: anywhere; }
+.mapping-checkbox input { accent-color: var(--accent); }
 .mapping-badge { padding: 3px 8px; border-radius: 6px; white-space: nowrap; font-size: .7rem; font-weight: 800; }
 .mapping-badge--auto { color: var(--accent-dark); background: #e2f5ee; }
 .mapping-badge--manual { color: #1d4ed8; background: #e8efff; }
@@ -54,9 +58,13 @@ form, .results { padding: 24px; border: 1px solid var(--line); border-radius: 18
 .primary:disabled { cursor: wait; opacity: .65; }
 .alert { margin: 0 0 18px; padding: 13px 16px; border: 1px solid #e8a8a1; border-radius: 10px; color: #8e2c20; background: #fff1ef; }
 .results { margin-top: 28px; }
+.workbook-download { display: flex; margin-top: 28px; align-items: center; justify-content: space-between; gap: 24px; border-color: #a9d5c7; background: #f5fcf9; }
+.workbook-download p { max-width: 720px; margin: 8px 0 0; font-size: .92rem; }
 .result-heading { display: flex; margin-bottom: 18px; align-items: end; justify-content: space-between; gap: 16px; }
 .export, .pagination a { color: var(--accent-dark); font-weight: 800; text-decoration: none; }
 .export { padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px; }
+.export-primary { flex-shrink: 0; border-color: var(--accent); color: white; background: var(--accent); }
+.export-primary:hover { background: var(--accent-dark); }
 .table-meta { margin-bottom: 8px; color: var(--muted); font-size: .82rem; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
 table { width: 100%; border-collapse: collapse; font-size: .82rem; white-space: nowrap; }
@@ -71,8 +79,11 @@ tbody tr:hover { background: #f8fbf9; }
   .shell { padding-top: 36px; }
   .drop-grid { grid-template-columns: 1fr; }
   .drop-zone { min-height: 170px; }
-  form, .results { padding: 16px; }
+  form, .results, .workbook-download { padding: 16px; }
+  .workbook-download { align-items: stretch; flex-direction: column; }
+  .export-primary { text-align: center; }
   .mapping-grid { grid-template-columns: 1fr; }
   .mapping-row { grid-template-columns: 1fr; }
+  .mapping-checkboxes { grid-template-columns: 1fr; }
   .tolerance-control { flex-wrap: wrap; }
 }

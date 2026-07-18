@@ -66,10 +66,18 @@
     </form>
 
     {% if job_id %}
+      <section class="workbook-download">
+        <div>
+          <span class="eyebrow">Reconciliation complete</span>
+          <h2>Nine-sheet Excel report</h2>
+          <p>Includes original uploads, matched entries, missing GSTINs, unmatched entries, probable matches, date-only differences, and both reconciled result tables.</p>
+        </div>
+        <a class="export export-primary" href="{{ url_for('export', job_id=job_id) }}">Download 9-sheet workbook</a>
+      </section>
+
       <section class="results">
         <div class="result-heading">
           <div><span class="eyebrow">Output 01</span><h2>Purchase Register</h2></div>
-          <a class="export" href="{{ url_for('export', job_id=job_id, kind='pr') }}">Export XLSX</a>
         </div>
         {% with table=pr, kind='pr' %}{% include '_table.html' %}{% endwith %}
       </section>
@@ -77,7 +85,6 @@
       <section class="results">
         <div class="result-heading">
           <div><span class="eyebrow">Output 02</span><h2>GSTR-2B</h2></div>
-          <a class="export" href="{{ url_for('export', job_id=job_id, kind='gstr2b') }}">Export XLSX</a>
         </div>
         {% with table=gstr2b, kind='gstr2b' %}{% include '_table.html' %}{% endwith %}
       </section>
@@ -129,19 +136,28 @@
 
     function updateStatusBadge(entry) {
       const { statusBadge, value, suggestion, isRequired } = entry;
+      const hasValue = hasMappingValue(value);
       statusBadge.className = 'mapping-badge';
-      if (!value) {
+      if (!hasValue) {
         statusBadge.classList.add(isRequired ? 'mapping-badge--missing' : 'mapping-badge--optional');
         statusBadge.textContent = isRequired ? 'Needs a column' : 'Optional — skipped';
         return;
       }
-      if (suggestion.source === value && suggestion.score >= AUTO_MATCH_THRESHOLD) {
+      if (!Array.isArray(value) && suggestion.source === value && suggestion.score >= AUTO_MATCH_THRESHOLD) {
         statusBadge.classList.add('mapping-badge--auto');
         statusBadge.textContent = `Auto-matched · ${Math.round(suggestion.score)}%`;
       } else {
         statusBadge.classList.add('mapping-badge--manual');
-        statusBadge.textContent = 'Selected';
+        statusBadge.textContent = Array.isArray(value) ? `${value.length} selected` : 'Selected';
       }
+    }
+
+    function hasMappingValue(value) {
+      return Array.isArray(value) ? value.length > 0 : Boolean(value);
+    }
+
+    function entryUsesColumn(entry, column) {
+      return Array.isArray(entry.value) ? entry.value.includes(column) : entry.value === column;
     }
 
     function syncHiddenMapping(ctx) {
@@ -151,7 +167,7 @@
       }
       const mapping = {};
       Object.entries(ctx.state.entries).forEach(([preferred, entry]) => {
-        mapping[preferred] = entry.value || null;
+        mapping[preferred] = hasMappingValue(entry.value) ? entry.value : null;
       });
       ctx.hiddenInput.value = JSON.stringify(mapping);
     }
@@ -163,10 +179,25 @@
       const oldValue = entry.value;
 
       if (newValue) {
+        const taxableEntry = entries['Taxable Value'];
+        if (entryUsesColumn(taxableEntry, newValue)) {
+          taxableEntry.checkboxes.forEach((checkbox) => {
+            if (checkbox.value === newValue) checkbox.checked = false;
+          });
+          taxableEntry.value = taxableEntry.checkboxes
+            .filter((checkbox) => checkbox.checked)
+            .map((checkbox) => checkbox.value);
+          updateStatusBadge(taxableEntry);
+        }
+
         // Swap: if another field already claimed this column, hand it our old value
         // instead so the two rows "swoop" past each other without ever colliding.
         const collision = Object.entries(entries).find(
-          ([otherPreferred, otherEntry]) => otherPreferred !== preferred && otherEntry.value === newValue
+          ([otherPreferred, otherEntry]) => (
+            otherPreferred !== preferred
+            && otherPreferred !== 'Taxable Value'
+            && otherEntry.value === newValue
+          )
         );
         if (collision) {
           const [, otherEntry] = collision;
@@ -177,6 +208,29 @@
       }
 
       entry.value = newValue;
+      updateStatusBadge(entry);
+      hideMappingError(ctx);
+      syncHiddenMapping(ctx);
+    }
+
+    function handleTaxableMappingChange(ctx) {
+      const entries = ctx.state.entries;
+      const entry = entries['Taxable Value'];
+      const selectedColumns = entry.checkboxes
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => checkbox.value);
+
+      selectedColumns.forEach((column) => {
+        Object.entries(entries).forEach(([preferred, otherEntry]) => {
+          if (preferred !== 'Taxable Value' && otherEntry.value === column) {
+            otherEntry.select.value = '';
+            otherEntry.value = '';
+            updateStatusBadge(otherEntry);
+          }
+        });
+      });
+
+      entry.value = selectedColumns;
       updateStatusBadge(entry);
       hideMappingError(ctx);
       syncHiddenMapping(ctx);
@@ -203,6 +257,42 @@
           requiredBadge.className = 'required-badge';
           requiredBadge.textContent = 'Required';
           label.appendChild(requiredBadge);
+        }
+
+        if (preferred === 'Taxable Value') {
+          const taxableHint = document.createElement('span');
+          taxableHint.className = 'mapping-taxable-hint';
+          taxableHint.textContent = 'Select one or more columns; values are added row by row.';
+          label.appendChild(taxableHint);
+          const checkboxList = document.createElement('div');
+          checkboxList.className = 'mapping-checkboxes';
+          const statusBadge = document.createElement('span');
+          const checkboxes = data.columns.map((column) => {
+            const checkboxLabel = document.createElement('label');
+            checkboxLabel.className = 'mapping-checkbox';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = column;
+            checkbox.checked = column === initialValue;
+            checkboxLabel.append(checkbox, document.createTextNode(column));
+            checkboxList.appendChild(checkboxLabel);
+            return checkbox;
+          });
+          const entry = {
+            checkboxes,
+            statusBadge,
+            isRequired,
+            suggestion,
+            value: initialValue ? [initialValue] : [],
+          };
+          entries[preferred] = entry;
+          updateStatusBadge(entry);
+          checkboxes.forEach((checkbox) => {
+            checkbox.addEventListener('change', () => handleTaxableMappingChange(ctx));
+          });
+          row.append(label, checkboxList, statusBadge);
+          ctx.rows.appendChild(row);
+          return;
         }
 
         const select = document.createElement('select');
@@ -284,7 +374,7 @@
         if (!ctx.state) return; // preview never loaded; backend falls back to automatic matching
         hideMappingError(ctx);
         const missing = Object.entries(ctx.state.entries)
-          .filter(([, entry]) => entry.isRequired && !entry.value)
+          .filter(([, entry]) => entry.isRequired && !hasMappingValue(entry.value))
           .map(([preferred]) => preferred);
         if (missing.length) {
           valid = false;

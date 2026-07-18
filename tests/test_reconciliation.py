@@ -293,6 +293,33 @@ class ApplyColumnMappingTest(unittest.TestCase):
         result = apply_column_mapping(self.df, mapping, PREFERRED_COLUMNS, "Purchase Register")
         self.assertIsNone(result.loc[0, "HSN Code (optional)"])
 
+    def test_sums_multiple_taxable_value_columns_row_by_row(self):
+        dataframe = self.df.assign(taxable_base=[900], taxable_adjustment=[100])
+        mapping = {
+            "Supplier Name": "supplier",
+            "GSTIN": "gst_no",
+            "Invoice No": "inv_no",
+            "Invoice Date": "inv_date",
+            "Taxable Value": ["taxable_base", "taxable_adjustment"],
+        }
+
+        result = apply_column_mapping(dataframe, mapping, PREFERRED_COLUMNS, "Purchase Register")
+
+        self.assertEqual(result.loc[0, "Taxable Value"], 1000)
+
+    def test_rejects_reusing_a_taxable_value_source_for_another_field(self):
+        mapping = {
+            "Supplier Name": "supplier",
+            "GSTIN": "gst_no",
+            "Invoice No": "inv_no",
+            "Invoice Date": "inv_date",
+            "Taxable Value": ["taxable", "supplier"],
+        }
+
+        with self.assertRaises(ReconciliationInputError) as ctx:
+            apply_column_mapping(self.df, mapping, PREFERRED_COLUMNS, "Purchase Register")
+        self.assertIn("mapped once", str(ctx.exception))
+
     def test_required_columns_are_a_subset_of_preferred_columns(self):
         self.assertTrue(set(REQUIRED_COLUMNS).issubset(set(PREFERRED_COLUMNS)))
 

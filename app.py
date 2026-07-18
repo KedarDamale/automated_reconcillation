@@ -18,9 +18,10 @@ from reconciliation import (
     REQUIRED_COLUMNS,
     ReconciliationInputError,
     read_uploaded_columns,
-    run_reconciliation,
+    run_reconciliation_report,
     suggest_column_mapping,
 )
+from workbook_export import write_reconciliation_workbook
 
 
 if not logging.getLogger().handlers:
@@ -79,15 +80,18 @@ def create_app() -> Flask:
             pr_file.save(pr_path)
             gstr2b_file.save(gstr2b_path)
 
-            pr_result, gstr2b_result = run_reconciliation(
+            report = run_reconciliation_report(
                 pr_path,
                 gstr2b_path,
                 pr_mapping=pr_mapping,
                 gstr2b_mapping=gstr2b_mapping,
                 date_tolerance_days=date_tolerance_days,
             )
-            _save_result(pr_result, job_dir / "pr_result.json")
-            _save_result(gstr2b_result, job_dir / "gstr2b_result.json")
+            _save_result(report.pr_result, job_dir / "pr_result.json")
+            _save_result(report.gstr2b_result, job_dir / "gstr2b_result.json")
+            write_reconciliation_workbook(
+                report, job_dir / "gst_reconciliation_report.xlsx"
+            )
         except ReconciliationInputError as exc:
             if "job_dir" in locals():
                 _remove_job(job_dir)
@@ -120,21 +124,17 @@ def create_app() -> Flask:
             gstr2b=gstr2b_view,
         )
 
-    @app.get("/export/<job_id>/<kind>")
-    def export(job_id: str, kind: str):
-        names = {
-            "pr": ("pr_reconciled.xlsx", "pr_result.json"),
-            "gstr2b": ("gstr2b_reconciled.xlsx", "gstr2b_result.json"),
-        }
-        if kind not in names:
-            abort(404)
-        excel_name, json_name = names[kind]
+    @app.get("/export/<job_id>")
+    def export(job_id: str):
         job_dir = _job_dir(app, job_id)
-        excel_path = job_dir / excel_name
+        excel_path = job_dir / "gst_reconciliation_report.xlsx"
         if not excel_path.is_file():
-            rows = _load_rows(job_dir / json_name)
-            pd.DataFrame(rows).to_excel(excel_path)
-        return send_file(excel_path, as_attachment=True, download_name=excel_name)
+            abort(404)
+        return send_file(
+            excel_path,
+            as_attachment=True,
+            download_name="gst_reconciliation_report.xlsx",
+        )
 
     @app.errorhandler(413)
     def file_too_large(_error):
