@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
+import re
 from typing import Iterable
 
 import numpy as np
@@ -19,7 +20,8 @@ from reconciliation import MatchPair, ReconciliationReport
 SHEET_NAMES = [
     "1 Purchase Register",
     "2 GSTR-2B",
-    "3 PR Missing GSTIN",
+    # Excel worksheet titles cannot contain a slash.
+    "3 Missing & Invalid GSTIN",
     "4 Matched Entries",
     "5 PR Not in 2B",
     "6 2B Not in PR",
@@ -39,6 +41,8 @@ GRID = "B8C6D1"
 
 THIN_SIDE = Side(style="thin", color=GRID)
 THICK_SIDE = Side(style="thick", color=NAVY)
+DATE_NUMBER_FORMAT = "dd-mmm-yyyy"
+AMOUNT_NUMBER_FORMAT = "#,##0.00;[Red]-#,##0.00"
 
 
 def write_reconciliation_workbook(
@@ -61,14 +65,9 @@ def write_reconciliation_workbook(
         report.gstr2b_raw,
     )
 
-    missing_index_frame = pd.DataFrame(
-        {"PR Index": report.pr_missing_gstin_indexes},
-        index=report.pr_missing_gstin_indexes,
-    )
-    missing_rows = report.pr_raw.loc[report.pr_missing_gstin_indexes]
     _write_simple_sheet(
         workbook.create_sheet(SHEET_NAMES[2]),
-        pd.concat([missing_index_frame, missing_rows], axis=1),
+        _gstin_review_dataframe(report),
     )
 
     _write_grouped_sheet(
@@ -86,7 +85,7 @@ def write_reconciliation_workbook(
 
     _write_grouped_sheet(
         workbook.create_sheet(SHEET_NAMES[4]),
-        left_label="Purchase Register — Not in 2B",
+        left_label="Purchase Register - Not in 2B",
         left_index_label="PR Index",
         left_frame=report.pr_raw,
         center_label="Probable Score",
@@ -102,7 +101,7 @@ def write_reconciliation_workbook(
 
     _write_grouped_sheet(
         workbook.create_sheet(SHEET_NAMES[5]),
-        left_label="GSTR-2B — Not in Purchase Register",
+        left_label="GSTR-2B - Not in Purchase Register",
         left_index_label="2B Index",
         left_frame=report.gstr2b_raw,
         center_label="Probable Score",
@@ -150,6 +149,63 @@ def write_reconciliation_workbook(
     return output_path
 
 
+def _gstin_review_dataframe(report: ReconciliationReport) -> pd.DataFrame:
+    metadata_columns = ["Source", "Original Index", "GSTIN Issue", "Original GSTIN"]
+    source_columns = _review_source_columns(report.pr_raw, metadata_columns)
+    source_columns.extend(
+        column
+        for column in _review_source_columns(report.gstr2b_raw, metadata_columns)
+        if column not in source_columns
+    )
+    records: list[dict] = []
+
+    def add_records(
+        source: str,
+        raw_frame: pd.DataFrame,
+        issues: dict[int, str],
+        original_gstin_values: dict[int, object],
+    ) -> None:
+        for index, issue in sorted(issues.items()):
+            record = {
+                "Source": source,
+                "Original Index": index,
+                "GSTIN Issue": issue,
+                "Original GSTIN": original_gstin_values.get(index),
+            }
+            for column, value in raw_frame.loc[index].items():
+                record[_review_column_name(column, metadata_columns)] = value
+            records.append(record)
+
+    add_records(
+        "Purchase Register",
+        report.pr_raw,
+        report.pr_gstin_issues,
+        report.pr_original_gstin_values,
+    )
+    add_records(
+        "GSTR-2B",
+        report.gstr2b_raw,
+        report.gstr2b_gstin_issues,
+        report.gstr2b_original_gstin_values,
+    )
+    return pd.DataFrame(records, columns=[*metadata_columns, *source_columns])
+
+
+def _review_source_columns(
+    dataframe: pd.DataFrame,
+    metadata_columns: list[str],
+) -> list[str]:
+    return [
+        _review_column_name(column, metadata_columns)
+        for column in dataframe.columns
+    ]
+
+
+def _review_column_name(column: object, metadata_columns: list[str]) -> str:
+    name = str(column)
+    return f"Raw {name}" if name in metadata_columns else name
+
+
 def _probable_row(
     unmatched_index: int,
     probable: MatchPair | None,
@@ -181,7 +237,13 @@ def _write_simple_sheet(worksheet: Worksheet, dataframe: pd.DataFrame) -> None:
 
     for row_number, row_values in enumerate(dataframe.itertuples(index=False, name=None), start=2):
         for column_number, value in enumerate(row_values, start=1):
-            _set_cell(worksheet, row_number, column_number, value)
+            _set_cell(
+                worksheet,
+                row_number,
+                column_number,
+                value,
+                header=headers[column_number - 1],
+            )
 
     if headers:
         last_column = get_column_letter(len(headers))
@@ -230,7 +292,13 @@ def _write_grouped_sheet(
         )
         values = [*left_values, center_value, *right_values]
         for column_number, value in enumerate(values, start=1):
-            cell = _set_cell(worksheet, row_number, column_number, value)
+            cell = _set_cell(
+                worksheet,
+                row_number,
+                column_number,
+                value,
+                header=all_headers[column_number - 1],
+            )
             if column_number == center_column and center_value is not None:
                 cell.number_format = "0.00" if emphasize_center else "0"
 
@@ -320,14 +388,103 @@ def _set_cell(
     row: int,
     column: int,
     value: object,
+    *,
+    header: str | None = None,
 ):
-    clean_value = _excel_value(value)
+    clean_value = _display_value(value, header)
     cell = worksheet.cell(row=row, column=column, value=clean_value)
     # CSV text beginning with '=' must remain literal upload data, not become
     # an executable Excel formula in the generated report.
     if isinstance(clean_value, str) and clean_value.startswith("="):
         cell.data_type = "s"
+    if _is_date_header(header) and isinstance(clean_value, (datetime, date)):
+        cell.number_format = DATE_NUMBER_FORMAT
+    elif _is_amount_header(header) and isinstance(clean_value, (int, float)):
+        cell.number_format = AMOUNT_NUMBER_FORMAT
     return cell
+
+
+def _display_value(value: object, header: str | None):
+    clean_value = _excel_value(value)
+    if _is_date_header(header):
+        parsed_date = _workbook_date_value(clean_value)
+        if parsed_date is not None:
+            return parsed_date.to_pydatetime()
+    if _is_amount_header(header):
+        parsed_amount = _workbook_amount_value(clean_value)
+        if parsed_amount is not None:
+            return parsed_amount
+    return clean_value
+
+
+def _is_date_header(header: str | None) -> bool:
+    if not header:
+        return False
+    normalized = " ".join(header.lower().split())
+    return "date" in normalized and "difference" not in normalized
+
+
+def _is_amount_header(header: str | None) -> bool:
+    if not header:
+        return False
+    normalized = " ".join(header.lower().split())
+    return normalized in {"taxable value", "igst", "cgst", "sgst", "total gst"} or "taxable" in normalized
+
+
+def _workbook_date_value(value: object) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.normalize()
+    if isinstance(value, (datetime, date)):
+        return pd.Timestamp(value).normalize()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _workbook_numeric_date(float(value))
+
+    text = str(value).strip()
+    if re.fullmatch(r"\d+(?:\.0+)?", text):
+        return _workbook_numeric_date(float(text))
+    for format_string in (
+        "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%d %B %Y",
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d",
+    ):
+        parsed = pd.to_datetime(text, format=format_string, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.normalize()
+    parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    return None if pd.isna(parsed) else parsed.normalize()
+
+
+def _workbook_numeric_date(value: float) -> pd.Timestamp | None:
+    if np.isnan(value):
+        return None
+    whole_value = int(value)
+    if value.is_integer() and 19000101 <= whole_value <= 29991231:
+        parsed = pd.to_datetime(str(whole_value), format="%Y%m%d", errors="coerce")
+    elif 1 <= value <= 100000:
+        parsed = pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce")
+    else:
+        return None
+    return None if pd.isna(parsed) else parsed.normalize()
+
+
+def _workbook_amount_value(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return None if isinstance(value, float) and np.isnan(value) else float(value)
+    text = str(value).strip().replace("\u00a0", "")
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    text = re.sub(r"[,$₹\s]", "", text)
+    if text.endswith("-"):
+        text = f"-{text[:-1]}"
+    try:
+        amount = float(text)
+    except (TypeError, ValueError):
+        return None
+    return -amount if negative else amount
 
 
 def _excel_value(value: object):

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
+import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +39,12 @@ DEFAULT_MATCH_THRESHOLD = 95
 MIN_DATE_TOLERANCE_DAYS = 0
 MAX_DATE_TOLERANCE_DAYS = 60
 DEFAULT_DATE_TOLERANCE_DAYS = 10
+NUMERIC_COLUMNS = {"Taxable Value", "IGST", "CGST", "SGST", "Total GST"}
+GSTIN_TOKEN_PATTERN = re.compile(
+    r"\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[A-Z0-9]"
+)
+MISSING_GSTIN = "Missing GSTIN"
+INVALID_GSTIN = "Invalid GSTIN"
 
 
 @dataclass(frozen=True)
@@ -57,11 +66,23 @@ class ReconciliationReport:
     gstr2b_result: pd.DataFrame
     matched_pairs: list[MatchPair]
     date_only_pairs: list[MatchPair]
-    pr_missing_gstin_indexes: list[int]
+    pr_gstin_issues: dict[int, str]
+    gstr2b_gstin_issues: dict[int, str]
+    pr_original_gstin_values: dict[int, object]
+    gstr2b_original_gstin_values: dict[int, object]
     pr_unmatched_indexes: list[int]
     gstr2b_unmatched_indexes: list[int]
     pr_probable_matches: dict[int, MatchPair]
     gstr2b_probable_matches: dict[int, MatchPair]
+
+    @property
+    def pr_missing_gstin_indexes(self) -> list[int]:
+        """Compatibility view for legacy callers that only need blank GSTIN rows."""
+        return [
+            index
+            for index, issue in self.pr_gstin_issues.items()
+            if issue == MISSING_GSTIN
+        ]
 
 
 class ReconciliationInputError(ValueError):
@@ -287,7 +308,7 @@ def _sum_taxable_value_columns(
     numeric_columns: list[pd.Series] = []
     for source_column in source_columns:
         source = df[source_column]
-        numeric = pd.to_numeric(source, errors="coerce")
+        numeric = source.apply(_normalize_numeric_value)
         present = source.notna() & source.astype(str).str.strip().ne("")
         invalid_count = int((present & numeric.isna()).sum())
         if invalid_count:
@@ -330,36 +351,127 @@ def extract_preferred_columns_from_df(
 def normalize_supplier_name(value):
     if _is_missing_value(value):
         return None
-    return str(value).lower().strip()
+    return " ".join(str(value).lower().split())
 
 
 def normalize_gstin(value):
+    gstin, _ = _canonical_gstin(value)
+    return gstin
+
+
+def _canonical_gstin(value: object) -> tuple[str | None, str | None]:
+    """Extract one structurally valid GSTIN from messy exported cell text.
+
+    Export systems commonly append tags such as ``_X000D_`` to a GSTIN. By
+    searching the compacted cell text for valid tokens, the genuine GSTIN is
+    retained while formatting artifacts are discarded. Ambiguous values are
+    intentionally not guessed.
+    """
     if _is_missing_value(value):
-        return None
-    return str(value).strip().upper()
+        return None, MISSING_GSTIN
+
+    text = unicodedata.normalize("NFKC", str(value)).upper()
+    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+    compact = re.sub(r"[^A-Z0-9]", "", text)
+    tokens = GSTIN_TOKEN_PATTERN.findall(compact)
+    if len(tokens) == 1:
+        return tokens[0], None
+    return None, INVALID_GSTIN
 
 
 def normalize_invoice_no(value):
     if _is_missing_value(value):
         return None
-    return str(value).strip().lower()
+    return _normalize_identifier(value).lower()
 
 
 def normalize_invoice_date(series: pd.Series) -> pd.Series:
-    date = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    return date.dt.year * 10000 + date.dt.month * 100 + date.dt.day
+    values = [
+        parsed.year * 10000 + parsed.month * 100 + parsed.day
+        if (parsed := _parse_date_value(value)) is not None
+        else pd.NA
+        for value in series
+    ]
+    return pd.Series(values, index=series.index, dtype="Int64")
 
 
 def normalize_hsn_code(value):
     if _is_missing_value(value):
         return None
-    return str(value).strip()
+    return _normalize_identifier(value)
 
 
 def normalize_numeric_col(value):
+    return _normalize_numeric_value(value)
+
+
+def _normalize_identifier(value: object) -> str:
+    text = str(value).strip()
+    decimal_identifier = re.fullmatch(r"(\d+)\.0+", text)
+    return decimal_identifier.group(1) if decimal_identifier else text
+
+
+def _normalize_numeric_value(value: object) -> float | None:
     if _is_missing_value(value):
         return None
-    return value
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        numeric = float(value)
+        return None if np.isnan(numeric) else numeric
+
+    text = str(value).strip().replace("\u00a0", "")
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    text = text.replace(",", "").replace("₹", "").replace("$", "")
+    text = re.sub(r"\s+", "", text)
+    if text.endswith("-"):
+        text = f"-{text[:-1]}"
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return None
+    return -numeric if negative else numeric
+
+
+def _parse_date_value(value: object) -> pd.Timestamp | None:
+    if _is_missing_value(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.normalize()
+    if isinstance(value, (datetime, date)):
+        return pd.Timestamp(value).normalize()
+
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        return _parse_numeric_date(float(value))
+
+    text = str(value).strip()
+    numeric_text = re.fullmatch(r"\d+(?:\.0+)?", text)
+    if numeric_text:
+        return _parse_numeric_date(float(text))
+
+    for format_string in (
+        "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%d %B %Y",
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d",
+    ):
+        parsed = pd.to_datetime(text, format=format_string, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.normalize()
+
+    parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    return None if pd.isna(parsed) else parsed.normalize()
+
+
+def _parse_numeric_date(value: float) -> pd.Timestamp | None:
+    if np.isnan(value):
+        return None
+    whole_value = int(value)
+    if value.is_integer() and 19000101 <= whole_value <= 29991231:
+        parsed = pd.to_datetime(str(whole_value), format="%Y%m%d", errors="coerce")
+    elif 1 <= value <= 100000:
+        parsed = pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce")
+    else:
+        return None
+    return None if pd.isna(parsed) else parsed.normalize()
 
 
 def _is_missing_value(value: object) -> bool:
@@ -373,28 +485,47 @@ def _is_missing_value(value: object) -> bool:
         return False
 
 
+def _gstin_issues_from_dataframe(dataframe: pd.DataFrame) -> dict[int, str]:
+    stored_issues = dataframe.attrs.get("gstin_issues")
+    if isinstance(stored_issues, dict):
+        return {int(index): issue for index, issue in stored_issues.items()}
+    return {
+        int(index): MISSING_GSTIN
+        for index in dataframe.index
+        if _is_missing_value(dataframe.at[index, "GSTIN"])
+    }
+
+
 def normalize_values(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Supplier Name"] = df["Supplier Name"].apply(normalize_supplier_name)
-    df["GSTIN"] = df["GSTIN"].apply(normalize_gstin)
+    gstin_values = df["GSTIN"].apply(_canonical_gstin)
+    df["GSTIN"] = gstin_values.apply(lambda result: result[0])
+    df["_GSTIN Issue"] = gstin_values.apply(lambda result: result[1])
     df["Invoice No"] = df["Invoice No"].apply(normalize_invoice_no)
     df["Invoice Date"] = normalize_invoice_date(df["Invoice Date"])
     df["HSN Code (optional)"] = df["HSN Code (optional)"].apply(normalize_hsn_code)
 
-    for column in ["Taxable Value", "IGST", "CGST", "SGST", "Total GST"]:
+    for column in NUMERIC_COLUMNS:
         df[column] = df[column].apply(normalize_numeric_col)
     return df
 
 
 def _validate_reconciliation_fields(df: pd.DataFrame, label: str) -> None:
-    empty = [column for column in REQUIRED_COLUMNS if df[column].isna().all()]
+    # GSTIN can be absent or malformed on every row; those rows are retained
+    # for the dedicated workbook review sheet instead of rejecting the upload.
+    empty = [
+        column
+        for column in REQUIRED_COLUMNS
+        if column != "GSTIN" and df[column].isna().all()
+    ]
     if empty:
         raise ReconciliationInputError(
             f"{label} is missing usable columns: {', '.join(empty)}. "
             "Check the column names and data."
         )
 
-    numeric = pd.to_numeric(df["Taxable Value"], errors="coerce")
+    numeric = df["Taxable Value"].apply(_normalize_numeric_value)
     invalid_count = int((df["Taxable Value"].notna() & numeric.isna()).sum())
     if invalid_count:
         raise ReconciliationInputError(
@@ -423,10 +554,21 @@ def prepare_dataframe_from_raw(
         dataframe = apply_column_mapping(dataframe, column_mapping, PREFERRED_COLUMNS, label)
     else:
         dataframe, _ = extract_preferred_columns_from_df(dataframe, PREFERRED_COLUMNS)
+    original_gstin_values = dataframe["GSTIN"].to_dict()
     dataframe = normalize_values(dataframe)
-    dataframe = dataframe[PREFERRED_COLUMNS]
-    _validate_reconciliation_fields(dataframe, label)
-    return dataframe
+    gstin_issues = {
+        int(index): issue
+        for index, issue in dataframe["_GSTIN Issue"].items()
+        # Pandas stores a mix of strings and ``None`` as an object column and
+        # may materialize the empty values as ``NaN``.  Treat both forms as
+        # "no issue" so valid GSTIN rows remain eligible for matching.
+        if not _is_missing_value(issue)
+    }
+    prepared = dataframe[PREFERRED_COLUMNS]
+    prepared.attrs["gstin_issues"] = gstin_issues
+    prepared.attrs["original_gstin_values"] = original_gstin_values
+    _validate_reconciliation_fields(prepared, label)
+    return prepared
 
 
 def reconcile(
@@ -441,6 +583,10 @@ def reconcile(
         twob,
         pr_raw=pur,
         gstr2b_raw=twob,
+        pr_gstin_issues=_gstin_issues_from_dataframe(pur),
+        gstr2b_gstin_issues=_gstin_issues_from_dataframe(twob),
+        pr_original_gstin_values=pur["GSTIN"].to_dict(),
+        gstr2b_original_gstin_values=twob["GSTIN"].to_dict(),
         similarity_threshold=similarity_threshold,
         numeric_tolerance=numeric_tolerance,
         date_tolerance_days=date_tolerance_days,
@@ -454,6 +600,10 @@ def _classify_reconciliation(
     *,
     pr_raw: pd.DataFrame,
     gstr2b_raw: pd.DataFrame,
+    pr_gstin_issues: dict[int, str] | None = None,
+    gstr2b_gstin_issues: dict[int, str] | None = None,
+    pr_original_gstin_values: dict[int, object] | None = None,
+    gstr2b_original_gstin_values: dict[int, object] | None = None,
     similarity_threshold: int = 80,
     numeric_tolerance: float = 0.01,
     date_tolerance_days: int = DEFAULT_DATE_TOLERANCE_DAYS,
@@ -475,18 +625,26 @@ def _classify_reconciliation(
     twob["Best probable PR index"] = pd.NA
     twob["Match category"] = "Unmatched"
 
-    pr_missing_gstin_indexes = [
-        int(index) for index in pur.index if _is_missing_value(pur.at[index, "GSTIN"])
-    ]
-    for index in pr_missing_gstin_indexes:
-        pur.at[index, "Match category"] = "Missing GSTIN"
+    pr_gstin_issues = pr_gstin_issues or _gstin_issues_from_dataframe(pur)
+    gstr2b_gstin_issues = gstr2b_gstin_issues or _gstin_issues_from_dataframe(twob)
+    pr_original_gstin_values = pr_original_gstin_values or pur["GSTIN"].to_dict()
+    gstr2b_original_gstin_values = (
+        gstr2b_original_gstin_values or twob["GSTIN"].to_dict()
+    )
+    for index, issue in pr_gstin_issues.items():
+        pur.at[index, "Match category"] = issue
+    for index, issue in gstr2b_gstin_issues.items():
+        twob.at[index, "Match category"] = issue
 
-    missing_gstin_set = set(pr_missing_gstin_indexes)
+    excluded_pr_indexes = set(pr_gstin_issues)
+    excluded_2b_indexes = set(gstr2b_gstin_issues)
     eligible_pr_indexes = [
-        int(index) for index in pur.index if index not in missing_gstin_set
+        int(index) for index in pur.index if index not in excluded_pr_indexes
     ]
     available_pr_indexes = set(eligible_pr_indexes)
-    available_2b_indexes = {int(index) for index in twob.index}
+    available_2b_indexes = {
+        int(index) for index in twob.index if index not in excluded_2b_indexes
+    }
     twob_indexes_by_gstin = {
         gstin: [int(index) for index in group.index]
         for gstin, group in twob.groupby("GSTIN", sort=False)
@@ -562,7 +720,10 @@ def _classify_reconciliation(
         gstr2b_result=twob,
         matched_pairs=matched_pairs,
         date_only_pairs=date_only_pairs,
-        pr_missing_gstin_indexes=pr_missing_gstin_indexes,
+        pr_gstin_issues=pr_gstin_issues,
+        gstr2b_gstin_issues=gstr2b_gstin_issues,
+        pr_original_gstin_values=pr_original_gstin_values,
+        gstr2b_original_gstin_values=gstr2b_original_gstin_values,
         pr_unmatched_indexes=pr_unmatched_indexes,
         gstr2b_unmatched_indexes=gstr2b_unmatched_indexes,
         pr_probable_matches=pr_probable_matches,
@@ -663,10 +824,8 @@ def _candidate_rows(
     candidate_pool = twob.loc[candidate_indexes]
 
     row_date = _invoice_timestamp(row["Invoice Date"])
-    pool_dates = pd.to_datetime(
-        candidate_pool["Invoice Date"], format="%Y%m%d", errors="coerce"
-    )
-    taxable_values = pd.to_numeric(candidate_pool["Taxable Value"], errors="coerce")
+    pool_dates = candidate_pool["Invoice Date"].apply(_invoice_timestamp)
+    taxable_values = candidate_pool["Taxable Value"].apply(_normalize_numeric_value)
     taxable_value = float(row["Taxable Value"])
     return candidate_pool[
         ((pool_dates - row_date).abs() <= pd.Timedelta(days=date_tolerance_days))
@@ -776,7 +935,7 @@ def _row_comparison_key(row: pd.Series, columns: list[str]) -> tuple:
 def _comparison_value(column: str, value: object):
     if _is_missing_value(value):
         return None
-    if column in {"Invoice Date", "Taxable Value", "IGST", "CGST", "SGST", "Total GST"}:
+    if column == "Invoice Date" or column in NUMERIC_COLUMNS:
         try:
             return Decimal(str(value)).normalize()
         except (InvalidOperation, ValueError):
@@ -792,14 +951,7 @@ def _has_required_candidate_values(row: pd.Series) -> bool:
 
 
 def _invoice_timestamp(value: object) -> pd.Timestamp | None:
-    if _is_missing_value(value):
-        return None
-    try:
-        compact_date = str(int(float(value)))
-    except (TypeError, ValueError, OverflowError):
-        return None
-    timestamp = pd.to_datetime(compact_date, format="%Y%m%d", errors="coerce")
-    return None if pd.isna(timestamp) else timestamp
+    return _parse_date_value(value)
 
 
 def _score_text(value: object) -> str:
@@ -832,6 +984,14 @@ def run_reconciliation_report(
         gstr2b,
         pr_raw=pr_raw,
         gstr2b_raw=gstr2b_raw,
+        pr_gstin_issues=_gstin_issues_from_dataframe(purchase_register),
+        gstr2b_gstin_issues=_gstin_issues_from_dataframe(gstr2b),
+        pr_original_gstin_values=purchase_register.attrs.get(
+            "original_gstin_values", purchase_register["GSTIN"].to_dict()
+        ),
+        gstr2b_original_gstin_values=gstr2b.attrs.get(
+            "original_gstin_values", gstr2b["GSTIN"].to_dict()
+        ),
         date_tolerance_days=date_tolerance_days,
     )
     elapsed = time.perf_counter() - start

@@ -29,6 +29,14 @@ if not logging.getLogger().handlers:
 
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 PAGE_SIZE = 10
+DISPLAY_AMOUNT_COLUMNS = {
+    "Taxable Value",
+    "IGST",
+    "CGST",
+    "SGST",
+    "Total GST",
+}
+DISPLAY_SCORE_COLUMNS = {"Best score", "Best probable score"}
 
 
 def create_app() -> Flask:
@@ -213,12 +221,38 @@ def _paginate(rows: list[dict], page: int) -> dict:
     page = min(page, pages)
     start = (page - 1) * PAGE_SIZE
     return {
-        "rows": rows[start : start + PAGE_SIZE],
+        "rows": [_format_result_row(row) for row in rows[start : start + PAGE_SIZE]],
         "columns": list(rows[0].keys()) if rows else [],
         "page": page,
         "pages": pages,
         "total": len(rows),
     }
+
+
+def _format_result_row(row: dict) -> dict:
+    return {
+        column: _format_result_value(column, value)
+        for column, value in row.items()
+    }
+
+
+def _format_result_value(column: str, value):
+    if value is None:
+        return value
+    if column == "Invoice Date":
+        try:
+            compact_date = str(int(float(value)))
+            parsed = pd.to_datetime(compact_date, format="%Y%m%d", errors="coerce")
+            if not pd.isna(parsed):
+                return parsed.strftime("%d-%b-%Y")
+        except (TypeError, ValueError, OverflowError):
+            return value
+    if column in DISPLAY_AMOUNT_COLUMNS | DISPLAY_SCORE_COLUMNS:
+        try:
+            return f"{float(value):,.2f}"
+        except (TypeError, ValueError):
+            return value
+    return value
 
 
 def _remove_job(job_dir: Path) -> None:

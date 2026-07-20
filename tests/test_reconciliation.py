@@ -9,6 +9,7 @@ from reconciliation import (
     REQUIRED_COLUMNS,
     ReconciliationInputError,
     apply_column_mapping,
+    normalize_gstin,
     run_reconciliation,
     suggest_column_mapping,
 )
@@ -190,6 +191,43 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur_wide, _ = run_reconciliation(pr, gstr2b, date_tolerance_days=15)
         self.assertEqual(pur_wide.loc[0, "Best match 2B index"], 0)
+
+    def test_matches_common_excel_date_and_number_formats(self):
+        excel_serial_date = (pd.Timestamp("2026-06-01") - pd.Timestamp("1899-12-30")).days
+        pr = _write_csv(self.dir, "pr.csv", HEADER, [
+            _row("Acme   Supplier", "22AAAAA0000A1Z5", "1001.0", "01/06/2026", '"1,000.00"'),
+        ])
+        gstr2b = _write_csv(self.dir, "2b.csv", HEADER, [
+            _row("acme supplier", "22AAAAA0000A1Z5", "1001", excel_serial_date, 1000),
+        ])
+
+        pur, twob = run_reconciliation(pr, gstr2b)
+
+        self.assertEqual(pur.loc[0, "Invoice Date"], 20260601)
+        self.assertEqual(pur.loc[0, "Taxable Value"], 1000)
+        self.assertEqual(pur.loc[0, "Invoice No"], "1001")
+        self.assertEqual(twob.loc[0, "Invoice Date"], 20260601)
+        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
+
+    def test_extracts_a_single_valid_gstin_from_copied_formatting_noise(self):
+        pr = _write_csv(self.dir, "pr.csv", HEADER, [
+            _row("Acme Supplier", "GSTIN: '27ADZFS0848J1Z8_X000D_'", "INV-001", "01/06/2026", 1000),
+        ])
+        gstr2b = _write_csv(self.dir, "2b.csv", HEADER, [
+            _row("Acme Supplier", "27ADZFS0848J1Z8", "INV-001", "01/06/2026", 1000),
+        ])
+
+        pur, twob = run_reconciliation(pr, gstr2b)
+
+        self.assertEqual(pur.loc[0, "GSTIN"], "27ADZFS0848J1Z8")
+        self.assertEqual(twob.loc[0, "GSTIN"], "27ADZFS0848J1Z8")
+        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
+
+    def test_gstin_normalization_handles_hidden_whitespace_and_separators(self):
+        self.assertEqual(
+            normalize_gstin("GSTIN: \u200b'27-ADZFS-0848J1Z8'\u00a0"),
+            "27ADZFS0848J1Z8",
+        )
 
 
 class SuggestColumnMappingTest(unittest.TestCase):

@@ -1,10 +1,11 @@
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
 
-from reconciliation import run_reconciliation_report
+from reconciliation import INVALID_GSTIN, MISSING_GSTIN, run_reconciliation_report
 from workbook_export import SHEET_NAMES, write_reconciliation_workbook
 
 
@@ -22,7 +23,7 @@ def row(supplier, gstin, invoice, invoice_date, hsn="0012", taxable=1000,
     )
 
 
-class SevenSheetWorkbookTest(unittest.TestCase):
+class NineSheetWorkbookTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.directory = Path(self.temp.name)
@@ -89,10 +90,17 @@ class SevenSheetWorkbookTest(unittest.TestCase):
         self.assertEqual(original["A2"].value, "ACME Exact")
         self.assertEqual(original["C2"].value, "000123")
         self.assertEqual(original["E2"].value, "0012")
+        self.assertEqual(original["D2"].value, datetime(2026, 6, 1))
+        self.assertEqual(original["D2"].number_format, "dd-mmm-yyyy")
+        self.assertEqual(original["F2"].value, 1000)
+        self.assertEqual(original["F2"].number_format, "#,##0.00;[Red]-#,##0.00")
 
-        missing = workbook["3 PR Missing GSTIN"]
-        self.assertEqual(missing["A2"].value, 3)
-        self.assertEqual(missing["B2"].value, "No GSTIN")
+        missing = workbook["3 Missing & Invalid GSTIN"]
+        self.assertEqual(missing["A2"].value, "Purchase Register")
+        self.assertEqual(missing["B2"].value, 3)
+        self.assertEqual(missing["C2"].value, MISSING_GSTIN)
+        self.assertEqual(missing["D2"].value, " ")
+        self.assertEqual(missing["E2"].value, "No GSTIN")
 
         matched = workbook["4 Matched Entries"]
         self.assertEqual(matched["A1"].value, "Purchase Register")
@@ -128,6 +136,8 @@ class SevenSheetWorkbookTest(unittest.TestCase):
             pr_reconciled.cell(2, pr_headers.index("Match category") + 1).value,
             "Matched",
         )
+        self.assertEqual(pr_reconciled["D2"].value, datetime(2026, 6, 1))
+        self.assertEqual(pr_reconciled["D2"].number_format, "dd-mmm-yyyy")
 
         gstr2b_reconciled = workbook["9 GSTR-2B Reconciled"]
         self.assertEqual(gstr2b_reconciled["A2"].value, "acme exact")
@@ -135,6 +145,50 @@ class SevenSheetWorkbookTest(unittest.TestCase):
         self.assertIn("Best match PR index", gstr2b_headers)
         self.assertIn("Probable PR indexes", gstr2b_headers)
         self.assertIn("Match category", gstr2b_headers)
+
+    def test_noisy_and_invalid_gstins_are_classified_once_for_review(self):
+        purchase_register = self._write_input(
+            "gstin-pr.csv",
+            [
+                row("Noisy GSTIN", "27ADZFS0848J1Z8_X000D_", "NOISY-1", "01/06/2026"),
+                row("Blank GSTIN", " ", "BLANK-1", "02/06/2026"),
+                row("Malformed GSTIN", "GST: NOT-VALID", "BAD-1", "03/06/2026"),
+            ],
+        )
+        gstr2b = self._write_input(
+            "gstin-2b.csv",
+            [
+                row("Noisy GSTIN", "27ADZFS0848J1Z8", "NOISY-1", "01/06/2026"),
+                row("Invalid 2B", "27ADZFS0848J1Z8 / 22AAAAA0000A1Z5", "BAD-2", "04/06/2026"),
+            ],
+        )
+
+        report = run_reconciliation_report(purchase_register, gstr2b)
+
+        self.assertEqual(report.pr_result.at[0, "GSTIN"], "27ADZFS0848J1Z8")
+        self.assertEqual([(pair.pr_index, pair.gstr2b_index) for pair in report.matched_pairs], [(0, 0)])
+        self.assertEqual(report.pr_gstin_issues, {1: MISSING_GSTIN, 2: INVALID_GSTIN})
+        self.assertEqual(report.gstr2b_gstin_issues, {1: INVALID_GSTIN})
+        self.assertEqual(report.pr_unmatched_indexes, [])
+        self.assertEqual(report.gstr2b_unmatched_indexes, [])
+
+        output = write_reconciliation_workbook(report, self.directory / "gstin-review.xlsx")
+        workbook = load_workbook(output)
+        review = workbook["3 Missing & Invalid GSTIN"]
+        rows = list(review.iter_rows(min_row=2, values_only=True))
+        self.assertEqual(
+            [(row_values[0], row_values[1], row_values[2]) for row_values in rows],
+            [
+                ("Purchase Register", 1, MISSING_GSTIN),
+                ("Purchase Register", 2, INVALID_GSTIN),
+                ("GSTR-2B", 1, INVALID_GSTIN),
+            ],
+        )
+        self.assertEqual(rows[0][3], " ")
+        self.assertEqual(rows[1][3], "GST: NOT-VALID")
+        self.assertEqual(rows[2][3], "27ADZFS0848J1Z8 / 22AAAAA0000A1Z5")
+        self.assertEqual(workbook["5 PR Not in 2B"].max_row, 2)
+        self.assertEqual(workbook["6 2B Not in PR"].max_row, 2)
 
     def test_date_only_requires_all_other_fields_and_obeys_tolerance(self):
         report = self._build_report(date_tolerance_days=4)

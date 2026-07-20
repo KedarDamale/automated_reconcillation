@@ -51,6 +51,8 @@ class ReconciliationAppTest(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn(b"12 rows", page.data)
         self.assertIn(b"Page 1 of 2", page.data)
+        self.assertIn(b"01-Jun-2026", page.data)
+        self.assertIn(b"1,000.00", page.data)
 
         job_id = result_url.rstrip("/").split("/")[-1]
         export = self.client.get(f"/export/{job_id}")
