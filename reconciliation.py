@@ -92,14 +92,27 @@ def handle_multitype_import(
 
 def read_uploaded_columns(file, filename: str) -> list[str]:
     extension = Path(filename).suffix.lower()
+    position = file.tell() if hasattr(file, "tell") else None
     try:
         if extension == ".csv":
             return pl.read_csv(file, n_rows=0).columns
         if extension == ".xlsx":
-            frame = pl.read_excel(file, engine="calamine", read_options={"n_rows": 0})
+            # Flask/Werkzeug provides a FileStorage stream. Calamine/fastexcel
+            # accepts paths, bytes, or memoryviews, but not that stream type.
+            # Read only for this preview request and restore the stream so the
+            # caller can still save or inspect the upload afterwards.
+            payload = file.read()
+            frame = pl.read_excel(
+                payload,
+                engine="calamine",
+                read_options={"n_rows": 0},
+            )
             return frame.columns
     except Exception as exc:
         raise ReconciliationInputError(f"Could not read {filename}: {exc}") from exc
+    finally:
+        if position is not None and hasattr(file, "seek"):
+            file.seek(position)
     raise ReconciliationInputError("Only .csv and .xlsx files are supported.")
 
 
@@ -250,6 +263,42 @@ def extract_preferred_columns_from_df(
 def _ensure_columns(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     missing = [pl.lit(None).alias(column) for column in columns if column not in df.columns]
     return df.with_columns(missing) if missing else df
+
+
+def _drop_empty_business_rows(
+    frame: pl.DataFrame,
+    mapping: dict[str, str | list[str] | None] | None,
+) -> pl.DataFrame:
+    """Ignore spreadsheet tail rows populated only by formulas/formatting.
+
+    Some accounting exports fill helper columns far below the actual register.
+    Those rows are not empty to the XLSX reader, but every reconciliation
+    source field is blank. Filtering against the selected source columns keeps
+    raw/result indexes aligned and avoids manufacturing missing-GSTIN records.
+    """
+    if mapping is None:
+        suggestions = suggest_column_mapping(frame.columns, PREFERRED_COLUMNS)
+        sources: list[str] = [
+            info["source"] for info in suggestions.values() if info["source"] is not None
+        ]
+    else:
+        sources = []
+        for value in mapping.values():
+            if isinstance(value, str) and value:
+                sources.append(value)
+            elif isinstance(value, (list, tuple)):
+                sources.extend(source for source in value if isinstance(source, str) and source)
+    sources = list(dict.fromkeys(source for source in sources if source in frame.columns))
+    if not sources:
+        return frame
+    present = pl.any_horizontal(
+        [
+            pl.col(source).is_not_null()
+            & pl.col(source).cast(pl.String, strict=False).str.strip_chars().ne("")
+            for source in sources
+        ]
+    )
+    return frame.filter(present)
 
 
 def _is_missing_value(value: object) -> bool:
@@ -749,6 +798,8 @@ def run_reconciliation_report(
     stage = total
     pr_raw = handle_multitype_import(pr_path, preserve_raw_values=True)
     gstr2b_raw = handle_multitype_import(gstr2b_path, preserve_raw_values=True)
+    pr_raw = _drop_empty_business_rows(pr_raw, pr_mapping)
+    gstr2b_raw = _drop_empty_business_rows(gstr2b_raw, gstr2b_mapping)
     logger.info(
         "read inputs: pr_rows=%d gstr2b_rows=%d elapsed=%.3fs",
         pr_raw.height, gstr2b_raw.height, time.perf_counter() - stage,

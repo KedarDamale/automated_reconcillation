@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import fastexcel
+import xlsxwriter
 
 from app import create_app
 from workbook_export import SHEET_NAMES
@@ -107,6 +108,30 @@ class ReconciliationAppTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("must be a .csv or .xlsx file", response.get_json()["error"])
+
+    def test_columns_preview_reads_xlsx_upload_stream(self):
+        xlsx = io.BytesIO()
+        workbook = xlsxwriter.Workbook(xlsx, {"in_memory": True})
+        worksheet = workbook.add_worksheet()
+        worksheet.write_row(0, 0, COLUMNS.strip().split(","))
+        worksheet.write_row(
+            1, 0,
+            ["Acme", "22AAAAA0000A1Z5", "INV-1", "01/06/2026", "1001",
+             1000, 0, 90, 90, 180],
+        )
+        workbook.close()
+        xlsx.seek(0)
+
+        response = self.client.post(
+            "/columns",
+            data={"file": (xlsx, "purchase.xlsx")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["columns"], COLUMNS.strip().split(","))
+        self.assertEqual(payload["suggestions"]["GSTIN"]["source"], "GSTIN")
 
     def test_reconcile_honors_a_user_confirmed_column_mapping(self):
         pr_csv = io.BytesIO(
