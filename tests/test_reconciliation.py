@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
+import xlsxwriter
 
 from reconciliation import (
     PREFERRED_COLUMNS,
@@ -18,6 +20,11 @@ HEADER = (
     "Supplier Name,GSTIN,Invoice No,Invoice Date,HSN Code (optional),"
     "Taxable Value,IGST,CGST,SGST,Total GST\n"
 )
+
+
+def cell(frame: pl.DataFrame, row: int, column: str):
+    value = frame[column][row]
+    return value.to_list() if isinstance(value, pl.Series) else value
 
 
 def _row(supplier, gstin, invoice_no, date, taxable, igst=0, cgst=90, sgst=90, total_gst=180):
@@ -48,10 +55,10 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "Best score"], 100.0)
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
-        self.assertTrue(pd.isna(pur.loc[0, "Probable 2B indexes"]))
-        self.assertEqual(twob.loc[0, "Best match PR index"], 0)
+        self.assertEqual(cell(pur, 0, "Best score"), 100.0)
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
+        self.assertIsNone(cell(pur, 0, "Probable 2B indexes"))
+        self.assertEqual(cell(twob, 0, "Best match PR index"), 0)
 
     def test_fuzzy_supplier_name_still_matches_above_threshold(self):
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
@@ -63,8 +70,8 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertGreaterEqual(pur.loc[0, "Best score"], 80)
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
+        self.assertGreaterEqual(cell(pur, 0, "Best score"), 80)
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
 
     def test_invoice_date_within_10_days_matches_beyond_does_not(self):
         # Two unrelated GSTINs keep the pairs isolated so neither can
@@ -80,9 +87,9 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
-        self.assertTrue(pd.isna(pur.loc[1, "Best match 2B index"]))
-        self.assertTrue(pd.isna(pur.loc[1, "Probable 2B indexes"]))
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
+        self.assertIsNone(cell(pur, 1, "Best match 2B index"))
+        self.assertIsNone(cell(pur, 1, "Probable 2B indexes"))
 
     def test_taxable_value_tolerance_boundary(self):
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
@@ -96,8 +103,8 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
-        self.assertTrue(pd.isna(pur.loc[1, "Best match 2B index"]))
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
+        self.assertIsNone(cell(pur, 1, "Best match 2B index"))
 
     def test_weak_match_is_recorded_as_probable_on_both_sides(self):
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
@@ -109,9 +116,9 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertTrue(pd.isna(pur.loc[0, "Best match 2B index"]))
-        self.assertEqual(pur.loc[0, "Probable 2B indexes"], [0])
-        self.assertEqual(twob.loc[0, "Probable PR indexes"], [0])
+        self.assertIsNone(cell(pur, 0, "Best match 2B index"))
+        self.assertEqual(cell(pur, 0, "Probable 2B indexes"), [0])
+        self.assertEqual(cell(twob, 0, "Probable PR indexes"), [0])
 
     def test_different_gstin_produces_no_candidates(self):
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
@@ -123,8 +130,8 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertTrue(pd.isna(pur.loc[0, "Best match 2B index"]))
-        self.assertTrue(pd.isna(pur.loc[0, "Probable 2B indexes"]))
+        self.assertIsNone(cell(pur, 0, "Best match 2B index"))
+        self.assertIsNone(cell(pur, 0, "Probable 2B indexes"))
 
     def test_second_best_candidate_is_left_unmatched(self):
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
@@ -137,8 +144,8 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
-        self.assertTrue(pd.isna(twob.loc[1, "Best match PR index"]))
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
+        self.assertIsNone(cell(twob, 1, "Best match PR index"))
 
     def test_header_name_variants_are_reconciled_end_to_end(self):
         alt_header = (
@@ -154,8 +161,8 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "Best score"], 100.0)
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
+        self.assertEqual(cell(pur, 0, "Best score"), 100.0)
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
 
     def test_unsupported_extension_raises(self):
         pr = self.dir / "purchase.txt"
@@ -187,13 +194,13 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
         ])
 
         pur_default, _ = run_reconciliation(pr, gstr2b)
-        self.assertTrue(pd.isna(pur_default.loc[0, "Best match 2B index"]))
+        self.assertIsNone(cell(pur_default, 0, "Best match 2B index"))
 
         pur_wide, _ = run_reconciliation(pr, gstr2b, date_tolerance_days=15)
-        self.assertEqual(pur_wide.loc[0, "Best match 2B index"], 0)
+        self.assertEqual(cell(pur_wide, 0, "Best match 2B index"), 0)
 
     def test_matches_common_excel_date_and_number_formats(self):
-        excel_serial_date = (pd.Timestamp("2026-06-01") - pd.Timestamp("1899-12-30")).days
+        excel_serial_date = (date(2026, 6, 1) - date(1899, 12, 30)).days
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
             _row("Acme   Supplier", "22AAAAA0000A1Z5", "1001.0", "01/06/2026", '"1,000.00"'),
         ])
@@ -203,11 +210,11 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "Invoice Date"], 20260601)
-        self.assertEqual(pur.loc[0, "Taxable Value"], 1000)
-        self.assertEqual(pur.loc[0, "Invoice No"], "1001")
-        self.assertEqual(twob.loc[0, "Invoice Date"], 20260601)
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
+        self.assertEqual(cell(pur, 0, "Invoice Date"), 20260601)
+        self.assertEqual(cell(pur, 0, "Taxable Value"), 1000)
+        self.assertEqual(cell(pur, 0, "Invoice No"), "1001")
+        self.assertEqual(cell(twob, 0, "Invoice Date"), 20260601)
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
 
     def test_extracts_a_single_valid_gstin_from_copied_formatting_noise(self):
         pr = _write_csv(self.dir, "pr.csv", HEADER, [
@@ -219,15 +226,60 @@ class RunReconciliationEndToEndTest(unittest.TestCase):
 
         pur, twob = run_reconciliation(pr, gstr2b)
 
-        self.assertEqual(pur.loc[0, "GSTIN"], "27ADZFS0848J1Z8")
-        self.assertEqual(twob.loc[0, "GSTIN"], "27ADZFS0848J1Z8")
-        self.assertEqual(pur.loc[0, "Best match 2B index"], 0)
+        self.assertEqual(cell(pur, 0, "GSTIN"), "27ADZFS0848J1Z8")
+        self.assertEqual(cell(twob, 0, "GSTIN"), "27ADZFS0848J1Z8")
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
 
     def test_gstin_normalization_handles_hidden_whitespace_and_separators(self):
         self.assertEqual(
             normalize_gstin("GSTIN: \u200b'27-ADZFS-0848J1Z8'\u00a0"),
             "27ADZFS0848J1Z8",
         )
+
+    def test_duplicate_exact_rows_pair_by_occurrence(self):
+        rows = [
+            _row("Acme Supplier", "22AAAAA0000A1Z5", "DUP-1", "01/06/2026", 1000),
+            _row("Acme Supplier", "22AAAAA0000A1Z5", "DUP-1", "01/06/2026", 1000),
+        ]
+        pr = _write_csv(self.dir, "duplicates-pr.csv", HEADER, rows)
+        gstr2b = _write_csv(self.dir, "duplicates-2b.csv", HEADER, rows)
+
+        pur, twob = run_reconciliation(pr, gstr2b)
+
+        self.assertEqual(pur["Best match 2B index"].to_list(), [0, 1])
+        self.assertEqual(twob["Best match PR index"].to_list(), [0, 1])
+
+    def test_equal_fuzzy_scores_use_lowest_available_index(self):
+        pr = _write_csv(self.dir, "tie-pr.csv", HEADER, [
+            _row("Acme Supplier A", "22AAAAA0000A1Z5", "INV-A", "01/06/2026", 1000),
+            _row("Acme Supplier A", "22AAAAA0000A1Z5", "INV-A", "01/06/2026", 1000),
+        ])
+        gstr2b = _write_csv(self.dir, "tie-2b.csv", HEADER, [
+            _row("Acme Supplier AB", "22AAAAA0000A1Z5", "INV-AB", "01/06/2026", 1000),
+            _row("Acme Supplier AB", "22AAAAA0000A1Z5", "INV-AB", "01/06/2026", 1000),
+        ])
+
+        pur, _ = run_reconciliation(pr, gstr2b)
+
+        self.assertEqual(pur["Best match 2B index"].to_list(), [0, 1])
+
+    def test_xlsx_input_uses_fastexcel_and_preserves_identifiers(self):
+        paths = [self.dir / "purchase.xlsx", self.dir / "gstr2b.xlsx"]
+        for path in paths:
+            workbook = xlsxwriter.Workbook(path)
+            worksheet = workbook.add_worksheet()
+            worksheet.write_row(0, 0, HEADER.strip().split(","))
+            worksheet.write_row(1, 0, [
+                "Acme Supplier", "22AAAAA0000A1Z5", "000123", "01/06/2026",
+                "0012", 1000, 0, 90, 90, 180,
+            ])
+            workbook.close()
+
+        pur, _ = run_reconciliation(*paths)
+
+        self.assertEqual(cell(pur, 0, "Invoice No"), "000123")
+        self.assertEqual(cell(pur, 0, "HSN Code (optional)"), "0012")
+        self.assertEqual(cell(pur, 0, "Best match 2B index"), 0)
 
 
 class SuggestColumnMappingTest(unittest.TestCase):
@@ -258,7 +310,7 @@ class SuggestColumnMappingTest(unittest.TestCase):
 
 class ApplyColumnMappingTest(unittest.TestCase):
     def setUp(self):
-        self.df = pd.DataFrame(
+        self.df = pl.DataFrame(
             {
                 "supplier": ["Acme"],
                 "gst_no": ["22AAAAA0000A1Z5"],
@@ -278,9 +330,9 @@ class ApplyColumnMappingTest(unittest.TestCase):
         }
         result = apply_column_mapping(self.df, mapping, PREFERRED_COLUMNS, "Purchase Register")
 
-        self.assertEqual(result.loc[0, "Supplier Name"], "Acme")
-        self.assertEqual(result.loc[0, "GSTIN"], "22AAAAA0000A1Z5")
-        self.assertIsNone(result.loc[0, "HSN Code (optional)"])
+        self.assertEqual(cell(result, 0, "Supplier Name"), "Acme")
+        self.assertEqual(cell(result, 0, "GSTIN"), "22AAAAA0000A1Z5")
+        self.assertIsNone(cell(result, 0, "HSN Code (optional)"))
 
     def test_rejects_a_source_column_used_for_two_preferred_fields(self):
         mapping = {
@@ -329,10 +381,13 @@ class ApplyColumnMappingTest(unittest.TestCase):
             "HSN Code (optional)": None,
         }
         result = apply_column_mapping(self.df, mapping, PREFERRED_COLUMNS, "Purchase Register")
-        self.assertIsNone(result.loc[0, "HSN Code (optional)"])
+        self.assertIsNone(cell(result, 0, "HSN Code (optional)"))
 
     def test_sums_multiple_taxable_value_columns_row_by_row(self):
-        dataframe = self.df.assign(taxable_base=[900], taxable_adjustment=[100])
+        dataframe = self.df.with_columns(
+            pl.Series("taxable_base", [900]),
+            pl.Series("taxable_adjustment", [100]),
+        )
         mapping = {
             "Supplier Name": "supplier",
             "GSTIN": "gst_no",
@@ -343,7 +398,7 @@ class ApplyColumnMappingTest(unittest.TestCase):
 
         result = apply_column_mapping(dataframe, mapping, PREFERRED_COLUMNS, "Purchase Register")
 
-        self.assertEqual(result.loc[0, "Taxable Value"], 1000)
+        self.assertEqual(cell(result, 0, "Taxable Value"), 1000)
 
     def test_rejects_reusing_a_taxable_value_source_for_another_field(self):
         mapping = {

@@ -4,9 +4,10 @@ import json
 import logging
 import math
 import uuid
+from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
 from werkzeug.utils import secure_filename
 
@@ -187,11 +188,8 @@ def _parse_date_tolerance(raw: str | None) -> int:
     return min(max(value, MIN_DATE_TOLERANCE_DAYS), MAX_DATE_TOLERANCE_DAYS)
 
 
-def _save_result(dataframe: pd.DataFrame, json_path: Path) -> None:
-    json_path.write_text(
-        dataframe.to_json(orient="records", date_format="iso"),
-        encoding="utf-8",
-    )
+def _save_result(dataframe: pl.DataFrame, json_path: Path) -> None:
+    dataframe.write_json(json_path)
 
 
 def _load_rows(path: Path) -> list[dict]:
@@ -242,9 +240,7 @@ def _format_result_value(column: str, value):
     if column == "Invoice Date":
         try:
             compact_date = str(int(float(value)))
-            parsed = pd.to_datetime(compact_date, format="%Y%m%d", errors="coerce")
-            if not pd.isna(parsed):
-                return parsed.strftime("%d-%b-%Y")
+            return datetime.strptime(compact_date, "%Y%m%d").strftime("%d-%b-%Y")
         except (TypeError, ValueError, OverflowError):
             return value
     if column in DISPLAY_AMOUNT_COLUMNS | DISPLAY_SCORE_COLUMNS:

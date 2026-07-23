@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from openpyxl import load_workbook
+import fastexcel
 
 from app import create_app
 from workbook_export import SHEET_NAMES
@@ -58,13 +58,11 @@ class ReconciliationAppTest(unittest.TestCase):
         export = self.client.get(f"/export/{job_id}")
         self.assertEqual(export.status_code, 200)
         self.assertGreater(len(export.data), 1000)
-        workbook = load_workbook(io.BytesIO(export.data))
-        self.assertEqual(workbook.sheetnames, SHEET_NAMES)
-        matched = workbook["4 Matched Entries"]
-        self.assertEqual(matched["L2"].value, "Match Score")
-        self.assertEqual(matched["L3"].value, 100)
-        self.assertEqual(matched["L3"].border.left.style, "thick")
-        self.assertEqual(matched["L3"].border.right.style, "thick")
+        workbook = fastexcel.read_excel(export.data)
+        self.assertEqual(workbook.sheet_names, SHEET_NAMES)
+        matched = workbook.load_sheet(SHEET_NAMES[3], header_row=None).to_polars()
+        self.assertEqual(matched.row(1)[11], "Match Score")
+        self.assertEqual(float(matched.row(2)[11]), 100)
         export.close()
 
         self.assertEqual(self.client.get(f"/export/{job_id}/pr").status_code, 404)

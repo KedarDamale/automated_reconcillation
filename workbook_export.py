@@ -1,204 +1,270 @@
-"""Build the user-facing nine-sheet GST reconciliation workbook."""
+"""Streaming nine-sheet GST reconciliation workbook writer."""
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from pathlib import Path
+import logging
 import re
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+import polars as pl
+import xlsxwriter
 
 from reconciliation import MatchPair, ReconciliationReport
 
+logger = logging.getLogger(__name__)
 
 SHEET_NAMES = [
-    "1 Purchase Register",
-    "2 GSTR-2B",
-    # Excel worksheet titles cannot contain a slash.
-    "3 Missing & Invalid GSTIN",
-    "4 Matched Entries",
-    "5 PR Not in 2B",
-    "6 2B Not in PR",
-    "7 Date Only",
-    "8 PR Reconciled",
-    "9 GSTR-2B Reconciled",
+    "1 Purchase Register", "2 GSTR-2B", "3 Missing & Invalid GSTIN",
+    "4 Matched Entries", "5 PR Not in 2B", "6 2B Not in PR", "7 Date Only",
+    "8 PR Reconciled", "9 GSTR-2B Reconciled",
 ]
-
-NAVY = "17324D"
-BLUE = "DCEAF7"
-PALE_BLUE = "EEF5FB"
-GOLD = "F8D66D"
-PALE_GOLD = "FFF5CC"
-GREEN = "DDEEDB"
-WHITE = "FFFFFF"
-GRID = "B8C6D1"
-
-THIN_SIDE = Side(style="thin", color=GRID)
-THICK_SIDE = Side(style="thick", color=NAVY)
+NAVY = "#17324D"
+BLUE = "#DCEAF7"
+PALE_BLUE = "#EEF5FB"
+GOLD = "#F8D66D"
+PALE_GOLD = "#FFF5CC"
+GREEN = "#DDEEDB"
+WHITE = "#FFFFFF"
+GRID = "#B8C6D1"
 DATE_NUMBER_FORMAT = "dd-mmm-yyyy"
 AMOUNT_NUMBER_FORMAT = "#,##0.00;[Red]-#,##0.00"
+EXCEL_MAX_ROWS = 1_048_576
+WIDTH_SAMPLE_ROWS = 250
+
+
+def _formats(workbook: xlsxwriter.Workbook) -> dict[str, xlsxwriter.format.Format]:
+    return {
+        "header": workbook.add_format({
+            "bold": True, "font_color": WHITE, "bg_color": NAVY,
+            "align": "center", "valign": "vcenter", "text_wrap": True,
+            "bottom": 1, "bottom_color": GRID,
+        }),
+        "date": workbook.add_format({"num_format": DATE_NUMBER_FORMAT}),
+        "amount": workbook.add_format({"num_format": AMOUNT_NUMBER_FORMAT}),
+        "score": workbook.add_format({
+            "bold": True, "font_color": NAVY, "bg_color": PALE_GOLD,
+            "align": "center", "valign": "vcenter",
+            "left": 5, "right": 5, "left_color": NAVY, "right_color": NAVY,
+            "num_format": "0.00",
+        }),
+        "score_header": workbook.add_format({
+            "bold": True, "font_color": NAVY, "bg_color": GOLD,
+            "align": "center", "valign": "vcenter",
+            "left": 5, "right": 5, "left_color": NAVY, "right_color": NAVY,
+        }),
+        "date_difference": workbook.add_format({
+            "bold": True, "font_color": NAVY, "bg_color": PALE_BLUE,
+            "align": "center", "valign": "vcenter", "num_format": "0",
+        }),
+        "group_blue": workbook.add_format({
+            "bold": True, "font_color": NAVY, "bg_color": BLUE,
+            "font_size": 12, "align": "center", "valign": "vcenter",
+        }),
+        "group_gold": workbook.add_format({
+            "bold": True, "font_color": NAVY, "bg_color": GOLD,
+            "font_size": 12, "align": "center", "valign": "vcenter",
+        }),
+        "group_green": workbook.add_format({
+            "bold": True, "font_color": NAVY, "bg_color": GREEN,
+            "font_size": 12, "align": "center", "valign": "vcenter",
+        }),
+    }
 
 
 def write_reconciliation_workbook(
-    report: ReconciliationReport,
-    output_path: str | Path,
+    report: ReconciliationReport, output_path: str | Path
 ) -> Path:
-    """Write all raw, classified, and reconciled views to one XLSX file."""
+    started = time.perf_counter()
     output_path = Path(output_path)
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    workbook.properties.title = "GST Reconciliation Report"
-    workbook.properties.subject = "Purchase Register and GSTR-2B reconciliation"
-
-    _write_simple_sheet(
-        workbook.create_sheet(SHEET_NAMES[0]),
-        report.pr_raw,
-    )
-    _write_simple_sheet(
-        workbook.create_sheet(SHEET_NAMES[1]),
-        report.gstr2b_raw,
-    )
-
-    _write_simple_sheet(
-        workbook.create_sheet(SHEET_NAMES[2]),
-        _gstin_review_dataframe(report),
-    )
-
-    _write_grouped_sheet(
-        workbook.create_sheet(SHEET_NAMES[3]),
-        left_label="Purchase Register",
-        left_index_label="PR Index",
-        left_frame=report.pr_raw,
-        center_label="Match Score",
-        right_label="GSTR-2B",
-        right_index_label="2B Index",
-        right_frame=report.gstr2b_raw,
-        rows=[(pair.pr_index, pair.score, pair.gstr2b_index) for pair in report.matched_pairs],
-        emphasize_center=True,
-    )
-
-    _write_grouped_sheet(
-        workbook.create_sheet(SHEET_NAMES[4]),
-        left_label="Purchase Register - Not in 2B",
-        left_index_label="PR Index",
-        left_frame=report.pr_raw,
-        center_label="Probable Score",
-        right_label="Probable GSTR-2B Match",
-        right_index_label="2B Index",
-        right_frame=report.gstr2b_raw,
-        rows=[
-            _probable_row(index, report.pr_probable_matches.get(index), reverse=False)
-            for index in report.pr_unmatched_indexes
-        ],
-        emphasize_center=True,
-    )
-
-    _write_grouped_sheet(
-        workbook.create_sheet(SHEET_NAMES[5]),
-        left_label="GSTR-2B - Not in Purchase Register",
-        left_index_label="2B Index",
-        left_frame=report.gstr2b_raw,
-        center_label="Probable Score",
-        right_label="Probable Purchase Register Match",
-        right_index_label="PR Index",
-        right_frame=report.pr_raw,
-        rows=[
-            _probable_row(index, report.gstr2b_probable_matches.get(index), reverse=True)
-            for index in report.gstr2b_unmatched_indexes
-        ],
-        emphasize_center=True,
-    )
-
-    _write_grouped_sheet(
-        workbook.create_sheet(SHEET_NAMES[6]),
-        left_label="Purchase Register",
-        left_index_label="PR Index",
-        left_frame=report.pr_raw,
-        center_label="Date Difference (Days)",
-        right_label="GSTR-2B",
-        right_index_label="2B Index",
-        right_frame=report.gstr2b_raw,
-        rows=[
-            (
-                pair.pr_index,
-                _date_difference_days(report, pair),
-                pair.gstr2b_index,
-            )
-            for pair in report.date_only_pairs
-        ],
-        emphasize_center=False,
-    )
-
-    _write_simple_sheet(
-        workbook.create_sheet(SHEET_NAMES[7]),
-        report.pr_result,
-    )
-    _write_simple_sheet(
-        workbook.create_sheet(SHEET_NAMES[8]),
-        report.gstr2b_result,
-    )
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(output_path)
+    workbook = xlsxwriter.Workbook(
+        str(output_path),
+        {"constant_memory": True, "strings_to_numbers": False, "strings_to_formulas": False},
+    )
+    workbook.set_properties({
+        "title": "GST Reconciliation Report",
+        "subject": "Purchase Register and GSTR-2B reconciliation",
+    })
+    formats = _formats(workbook)
+    try:
+        _write_simple_sheet(workbook, SHEET_NAMES[0], report.pr_raw, formats)
+        _write_simple_sheet(workbook, SHEET_NAMES[1], report.gstr2b_raw, formats)
+        _write_simple_sheet(workbook, SHEET_NAMES[2], _gstin_review_dataframe(report), formats)
+        _write_grouped_sheet(
+            workbook, SHEET_NAMES[3], "Purchase Register", "PR Index", report.pr_raw,
+            "Match Score", "GSTR-2B", "2B Index", report.gstr2b_raw,
+            ((p.pr_index, p.score, p.gstr2b_index) for p in report.matched_pairs),
+            formats, True,
+        )
+        _write_grouped_sheet(
+            workbook, SHEET_NAMES[4], "Purchase Register - Not in 2B", "PR Index",
+            report.pr_raw, "Probable Score", "Probable GSTR-2B Match", "2B Index",
+            report.gstr2b_raw,
+            (_probable_row(i, report.pr_probable_matches.get(i), False)
+             for i in report.pr_unmatched_indexes),
+            formats, True,
+        )
+        _write_grouped_sheet(
+            workbook, SHEET_NAMES[5], "GSTR-2B - Not in Purchase Register", "2B Index",
+            report.gstr2b_raw, "Probable Score", "Probable Purchase Register Match",
+            "PR Index", report.pr_raw,
+            (_probable_row(i, report.gstr2b_probable_matches.get(i), True)
+             for i in report.gstr2b_unmatched_indexes),
+            formats, True,
+        )
+        _write_grouped_sheet(
+            workbook, SHEET_NAMES[6], "Purchase Register", "PR Index", report.pr_raw,
+            "Date Difference (Days)", "GSTR-2B", "2B Index", report.gstr2b_raw,
+            ((p.pr_index, _date_difference_days(report, p), p.gstr2b_index)
+             for p in report.date_only_pairs),
+            formats, False,
+        )
+        _write_simple_sheet(workbook, SHEET_NAMES[7], report.pr_result, formats)
+        _write_simple_sheet(workbook, SHEET_NAMES[8], report.gstr2b_result, formats)
+    finally:
+        workbook.close()
+    logger.info(
+        "xlsx export: path=%s size=%d elapsed=%.3fs",
+        output_path, output_path.stat().st_size, time.perf_counter() - started,
+    )
     return output_path
 
 
-def _gstin_review_dataframe(report: ReconciliationReport) -> pd.DataFrame:
-    metadata_columns = ["Source", "Original Index", "GSTIN Issue", "Original GSTIN"]
-    source_columns = _review_source_columns(report.pr_raw, metadata_columns)
-    source_columns.extend(
-        column
-        for column in _review_source_columns(report.gstr2b_raw, metadata_columns)
-        if column not in source_columns
-    )
-    records: list[dict] = []
+def _guard_rows(sheet_name: str, data_rows: int, header_rows: int) -> None:
+    if data_rows + header_rows > EXCEL_MAX_ROWS:
+        raise ValueError(
+            f'Worksheet "{sheet_name}" needs {data_rows + header_rows:,} rows; '
+            f"Excel supports at most {EXCEL_MAX_ROWS:,}."
+        )
 
-    def add_records(
-        source: str,
-        raw_frame: pd.DataFrame,
-        issues: dict[int, str],
-        original_gstin_values: dict[int, object],
-    ) -> None:
+
+def _write_simple_sheet(
+    workbook: xlsxwriter.Workbook, name: str, frame: pl.DataFrame,
+    formats: dict[str, xlsxwriter.format.Format],
+) -> None:
+    _guard_rows(name, frame.height, 1)
+    worksheet = workbook.add_worksheet(name)
+    headers = frame.columns
+    widths = [max(12, min(40, len(str(header)) + 2)) for header in headers]
+    worksheet.set_row(0, 24)
+    worksheet.write_row(0, 0, headers, formats["header"])
+    date_columns = {i for i, header in enumerate(headers) if _is_date_header(header)}
+    amount_columns = {i for i, header in enumerate(headers) if _is_amount_header(header)}
+    for column in date_columns:
+        worksheet.set_column(column, column, None, formats["date"])
+    for column in amount_columns:
+        worksheet.set_column(column, column, None, formats["amount"])
+    for row_number, values in enumerate(frame.iter_rows(), start=1):
+        clean = [_display_value(value, headers[i]) for i, value in enumerate(values)]
+        worksheet.write_row(row_number, 0, clean)
+        if row_number <= WIDTH_SAMPLE_ROWS:
+            for column, value in enumerate(clean):
+                if value is not None:
+                    widths[column] = min(40, max(widths[column], len(str(value)) + 2))
+    for column, width in enumerate(widths):
+        fmt = formats["date"] if column in date_columns else (
+            formats["amount"] if column in amount_columns else None
+        )
+        worksheet.set_column(column, column, width, fmt)
+    if headers:
+        worksheet.autofilter(0, 0, max(0, frame.height), len(headers) - 1)
+    worksheet.freeze_panes(1, 0)
+
+
+def _write_grouped_sheet(
+    workbook: xlsxwriter.Workbook, name: str,
+    left_label: str, left_index_label: str, left_frame: pl.DataFrame,
+    center_label: str, right_label: str, right_index_label: str,
+    right_frame: pl.DataFrame, rows: Iterable[tuple[int, float | int | None, int | None]],
+    formats: dict[str, xlsxwriter.format.Format], emphasize_center: bool,
+) -> None:
+    materialized_rows = list(rows)
+    _guard_rows(name, len(materialized_rows), 2)
+    worksheet = workbook.add_worksheet(name)
+    left_headers = [left_index_label, *left_frame.columns]
+    right_headers = [right_index_label, *right_frame.columns]
+    left_end = len(left_headers) - 1
+    center = len(left_headers)
+    right_start = center + 1
+    right_end = right_start + len(right_headers) - 1
+    worksheet.merge_range(0, 0, 0, left_end, left_label, formats["group_blue"])
+    worksheet.write(0, center, "Match", formats["group_gold"])
+    worksheet.merge_range(0, right_start, 0, right_end, right_label, formats["group_green"])
+    headers = [*left_headers, center_label, *right_headers]
+    worksheet.write_row(1, 0, headers, formats["header"])
+    worksheet.write(1, center, center_label, formats["score_header"])
+    for column, header in enumerate(headers):
+        if _is_date_header(header):
+            worksheet.set_column(column, column, None, formats["date"])
+        elif _is_amount_header(header):
+            worksheet.set_column(column, column, None, formats["amount"])
+    widths = [max(12, min(40, len(str(header)) + 2)) for header in headers]
+    for output_row, (left_index, center_value, right_index) in enumerate(
+        materialized_rows, start=2
+    ):
+        left = [left_index, *left_frame.row(left_index)]
+        right = (
+            [right_index, *right_frame.row(right_index)]
+            if right_index is not None else [None] * len(right_headers)
+        )
+        values = [*left, center_value, *right]
+        clean = [_display_value(value, headers[i]) for i, value in enumerate(values)]
+        worksheet.write_row(output_row, 0, clean)
+        if center_value is not None:
+            worksheet.write(
+                output_row, center, center_value,
+                formats["score"] if emphasize_center else formats["date_difference"],
+            )
+        if output_row < WIDTH_SAMPLE_ROWS + 2:
+            for column, value in enumerate(clean):
+                if value is not None:
+                    widths[column] = min(40, max(widths[column], len(str(value)) + 2))
+    for column, width in enumerate(widths):
+        header = headers[column]
+        fmt = formats["date"] if _is_date_header(header) else (
+            formats["amount"] if _is_amount_header(header) else None
+        )
+        worksheet.set_column(column, column, width, fmt)
+    worksheet.autofilter(1, 0, max(1, len(materialized_rows) + 1), right_end)
+    worksheet.freeze_panes(2, 0)
+    worksheet.set_row(0, 25)
+    worksheet.set_row(1, 24)
+
+
+def _gstin_review_dataframe(report: ReconciliationReport) -> pl.DataFrame:
+    metadata = ["Source", "Original Index", "GSTIN Issue", "Original GSTIN"]
+    source_columns = [_review_column_name(column, metadata) for column in report.pr_raw.columns]
+    for column in report.gstr2b_raw.columns:
+        reviewed = _review_column_name(column, metadata)
+        if reviewed not in source_columns:
+            source_columns.append(reviewed)
+    records: list[dict] = []
+    for source, frame, issues, originals in (
+        ("Purchase Register", report.pr_raw, report.pr_gstin_issues, report.pr_original_gstin_values),
+        ("GSTR-2B", report.gstr2b_raw, report.gstr2b_gstin_issues,
+         report.gstr2b_original_gstin_values),
+    ):
         for index, issue in sorted(issues.items()):
             record = {
-                "Source": source,
-                "Original Index": index,
-                "GSTIN Issue": issue,
-                "Original GSTIN": original_gstin_values.get(index),
+                "Source": source, "Original Index": index, "GSTIN Issue": issue,
+                "Original GSTIN": originals.get(index),
             }
-            for column, value in raw_frame.loc[index].items():
-                record[_review_column_name(column, metadata_columns)] = value
+            record.update({
+                _review_column_name(column, metadata): value
+                for column, value in frame.row(index, named=True).items()
+            })
             records.append(record)
-
-    add_records(
-        "Purchase Register",
-        report.pr_raw,
-        report.pr_gstin_issues,
-        report.pr_original_gstin_values,
+    schema = [*metadata, *source_columns]
+    if not records:
+        return pl.DataFrame({column: [] for column in schema})
+    return pl.DataFrame(records, infer_schema_length=None).select(
+        [pl.col(column) if column in records[0] or any(column in r for r in records)
+         else pl.lit(None).alias(column) for column in schema]
     )
-    add_records(
-        "GSTR-2B",
-        report.gstr2b_raw,
-        report.gstr2b_gstin_issues,
-        report.gstr2b_original_gstin_values,
-    )
-    return pd.DataFrame(records, columns=[*metadata_columns, *source_columns])
-
-
-def _review_source_columns(
-    dataframe: pd.DataFrame,
-    metadata_columns: list[str],
-) -> list[str]:
-    return [
-        _review_column_name(column, metadata_columns)
-        for column in dataframe.columns
-    ]
 
 
 def _review_column_name(column: object, metadata_columns: list[str]) -> str:
@@ -207,302 +273,107 @@ def _review_column_name(column: object, metadata_columns: list[str]) -> str:
 
 
 def _probable_row(
-    unmatched_index: int,
-    probable: MatchPair | None,
-    *,
-    reverse: bool,
+    unmatched_index: int, probable: MatchPair | None, reverse: bool,
 ) -> tuple[int, float | None, int | None]:
     if probable is None:
         return unmatched_index, None, None
-    probable_index = probable.pr_index if reverse else probable.gstr2b_index
-    return unmatched_index, probable.score, probable_index
+    return (
+        unmatched_index, probable.score,
+        probable.pr_index if reverse else probable.gstr2b_index,
+    )
 
 
 def _date_difference_days(report: ReconciliationReport, pair: MatchPair) -> int | None:
-    pr_value = report.pr_result.at[pair.pr_index, "Invoice Date"]
-    twob_value = report.gstr2b_result.at[pair.gstr2b_index, "Invoice Date"]
-    try:
-        pr_date = pd.to_datetime(str(int(float(pr_value))), format="%Y%m%d")
-        twob_date = pd.to_datetime(str(int(float(twob_value))), format="%Y%m%d")
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return abs((twob_date - pr_date).days)
-
-
-def _write_simple_sheet(worksheet: Worksheet, dataframe: pd.DataFrame) -> None:
-    headers = [str(column) for column in dataframe.columns]
-    for column_number, header in enumerate(headers, start=1):
-        cell = _set_cell(worksheet, 1, column_number, header)
-        _style_header(cell)
-
-    for row_number, row_values in enumerate(dataframe.itertuples(index=False, name=None), start=2):
-        for column_number, value in enumerate(row_values, start=1):
-            _set_cell(
-                worksheet,
-                row_number,
-                column_number,
-                value,
-                header=headers[column_number - 1],
-            )
-
-    if headers:
-        last_column = get_column_letter(len(headers))
-        worksheet.auto_filter.ref = f"A1:{last_column}{max(1, worksheet.max_row)}"
-    worksheet.freeze_panes = "A2"
-    worksheet.row_dimensions[1].height = 24
-    _set_column_widths(worksheet)
-
-
-def _write_grouped_sheet(
-    worksheet: Worksheet,
-    *,
-    left_label: str,
-    left_index_label: str,
-    left_frame: pd.DataFrame,
-    center_label: str,
-    right_label: str,
-    right_index_label: str,
-    right_frame: pd.DataFrame,
-    rows: Iterable[tuple[int, float | int | None, int | None]],
-    emphasize_center: bool,
-) -> None:
-    left_headers = [left_index_label, *[str(column) for column in left_frame.columns]]
-    right_headers = [right_index_label, *[str(column) for column in right_frame.columns]]
-    left_start = 1
-    left_end = len(left_headers)
-    center_column = left_end + 1
-    right_start = center_column + 1
-    right_end = right_start + len(right_headers) - 1
-
-    _merge_and_label(worksheet, 1, left_start, left_end, left_label, BLUE)
-    _merge_and_label(worksheet, 1, center_column, center_column, "Match", GOLD)
-    _merge_and_label(worksheet, 1, right_start, right_end, right_label, GREEN)
-
-    all_headers = [*left_headers, center_label, *right_headers]
-    for column_number, header in enumerate(all_headers, start=1):
-        cell = _set_cell(worksheet, 2, column_number, header)
-        _style_header(cell)
-
-    for row_number, (left_index, center_value, right_index) in enumerate(rows, start=3):
-        left_values = [left_index, *_frame_row_values(left_frame, left_index)]
-        right_values = (
-            [right_index, *_frame_row_values(right_frame, right_index)]
-            if right_index is not None
-            else [None] * len(right_headers)
-        )
-        values = [*left_values, center_value, *right_values]
-        for column_number, value in enumerate(values, start=1):
-            cell = _set_cell(
-                worksheet,
-                row_number,
-                column_number,
-                value,
-                header=all_headers[column_number - 1],
-            )
-            if column_number == center_column and center_value is not None:
-                cell.number_format = "0.00" if emphasize_center else "0"
-
-    worksheet.auto_filter.ref = (
-        f"A2:{get_column_letter(right_end)}{max(2, worksheet.max_row)}"
-    )
-    worksheet.freeze_panes = "A3"
-    worksheet.row_dimensions[1].height = 25
-    worksheet.row_dimensions[2].height = 24
-
-    if emphasize_center:
-        _emphasize_score_column(worksheet, center_column)
-    else:
-        for row_number in range(1, max(2, worksheet.max_row) + 1):
-            cell = worksheet.cell(row=row_number, column=center_column)
-            cell.fill = PatternFill("solid", fgColor=PALE_BLUE)
-            cell.font = Font(bold=True, color=NAVY)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    _set_column_widths(worksheet)
-
-
-def _frame_row_values(dataframe: pd.DataFrame, index: int | None) -> list:
-    if index is None:
-        return [None] * len(dataframe.columns)
-    return dataframe.loc[index].tolist()
-
-
-def _merge_and_label(
-    worksheet: Worksheet,
-    row: int,
-    start_column: int,
-    end_column: int,
-    label: str,
-    color: str,
-) -> None:
-    if end_column > start_column:
-        worksheet.merge_cells(
-            start_row=row,
-            start_column=start_column,
-            end_row=row,
-            end_column=end_column,
-        )
-    cell = _set_cell(worksheet, row, start_column, label)
-    cell.fill = PatternFill("solid", fgColor=color)
-    cell.font = Font(bold=True, color=NAVY, size=12)
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-    for column_number in range(start_column, end_column + 1):
-        worksheet.cell(row=row, column=column_number).fill = PatternFill(
-            "solid", fgColor=color
-        )
-
-
-def _style_header(cell) -> None:
-    cell.fill = PatternFill("solid", fgColor=NAVY)
-    cell.font = Font(bold=True, color=WHITE)
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.border = Border(bottom=THIN_SIDE)
-
-
-def _emphasize_score_column(worksheet: Worksheet, column_number: int) -> None:
-    for row_number in range(1, max(2, worksheet.max_row) + 1):
-        cell = worksheet.cell(row=row_number, column=column_number)
-        cell.fill = PatternFill("solid", fgColor=GOLD if row_number <= 2 else PALE_GOLD)
-        cell.font = Font(bold=True, color=NAVY)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(left=THICK_SIDE, right=THICK_SIDE)
-
-
-def _set_column_widths(worksheet: Worksheet) -> None:
-    for column_number in range(1, worksheet.max_column + 1):
-        maximum = 0
-        for row_number in range(1, min(worksheet.max_row, 250) + 1):
-            cell = worksheet.cell(row=row_number, column=column_number)
-            if cell.coordinate in worksheet.merged_cells:
-                continue
-            value = cell.value
-            if value is not None:
-                maximum = max(maximum, len(str(value)))
-        worksheet.column_dimensions[get_column_letter(column_number)].width = min(
-            max(maximum + 2, 12), 40
-        )
-
-
-def _set_cell(
-    worksheet: Worksheet,
-    row: int,
-    column: int,
-    value: object,
-    *,
-    header: str | None = None,
-):
-    clean_value = _display_value(value, header)
-    cell = worksheet.cell(row=row, column=column, value=clean_value)
-    # CSV text beginning with '=' must remain literal upload data, not become
-    # an executable Excel formula in the generated report.
-    if isinstance(clean_value, str) and clean_value.startswith("="):
-        cell.data_type = "s"
-    if _is_date_header(header) and isinstance(clean_value, (datetime, date)):
-        cell.number_format = DATE_NUMBER_FORMAT
-    elif _is_amount_header(header) and isinstance(clean_value, (int, float)):
-        cell.number_format = AMOUNT_NUMBER_FORMAT
-    return cell
-
-
-def _display_value(value: object, header: str | None):
-    clean_value = _excel_value(value)
-    if _is_date_header(header):
-        parsed_date = _workbook_date_value(clean_value)
-        if parsed_date is not None:
-            return parsed_date.to_pydatetime()
-    if _is_amount_header(header):
-        parsed_amount = _workbook_amount_value(clean_value)
-        if parsed_amount is not None:
-            return parsed_amount
-    return clean_value
+    pr = _workbook_date_value(report.pr_result["Invoice Date"][pair.pr_index])
+    twob = _workbook_date_value(report.gstr2b_result["Invoice Date"][pair.gstr2b_index])
+    return None if pr is None or twob is None else abs((twob - pr).days)
 
 
 def _is_date_header(header: str | None) -> bool:
-    if not header:
-        return False
-    normalized = " ".join(header.lower().split())
+    normalized = " ".join((header or "").lower().split())
     return "date" in normalized and "difference" not in normalized
 
 
 def _is_amount_header(header: str | None) -> bool:
-    if not header:
-        return False
-    normalized = " ".join(header.lower().split())
-    return normalized in {"taxable value", "igst", "cgst", "sgst", "total gst"} or "taxable" in normalized
+    normalized = " ".join((header or "").lower().split())
+    return (
+        normalized in {"taxable value", "igst", "cgst", "sgst", "total gst"}
+        or "taxable" in normalized
+    )
 
 
-def _workbook_date_value(value: object) -> pd.Timestamp | None:
+def _display_value(value: object, header: str | None) -> object:
+    value = _excel_value(value)
+    if _is_date_header(header):
+        parsed = _workbook_date_value(value)
+        return parsed if parsed is not None else value
+    if _is_amount_header(header):
+        parsed = _workbook_amount_value(value)
+        return parsed if parsed is not None else value
+    return value
+
+
+def _workbook_date_value(value: object) -> datetime | None:
     if value is None:
         return None
-    if isinstance(value, pd.Timestamp):
-        return value.normalize()
-    if isinstance(value, (datetime, date)):
-        return pd.Timestamp(value).normalize()
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return _workbook_numeric_date(float(value))
-
+    if isinstance(value, datetime):
+        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        number = float(value)
+        whole = int(number)
+        if number.is_integer() and 19000101 <= whole <= 29991231:
+            try:
+                return datetime.strptime(str(whole), "%Y%m%d")
+            except ValueError:
+                return None
+        if 1 <= number <= 100000:
+            return datetime(1899, 12, 30) + timedelta(days=number)
+        return None
     text = str(value).strip()
     if re.fullmatch(r"\d+(?:\.0+)?", text):
-        return _workbook_numeric_date(float(text))
-    for format_string in (
+        return _workbook_date_value(float(text))
+    for fmt in (
         "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%d %B %Y",
         "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d",
     ):
-        parsed = pd.to_datetime(text, format=format_string, errors="coerce")
-        if not pd.isna(parsed):
-            return parsed.normalize()
-    parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
-    return None if pd.isna(parsed) else parsed.normalize()
-
-
-def _workbook_numeric_date(value: float) -> pd.Timestamp | None:
-    if np.isnan(value):
-        return None
-    whole_value = int(value)
-    if value.is_integer() and 19000101 <= whole_value <= 29991231:
-        parsed = pd.to_datetime(str(whole_value), format="%Y%m%d", errors="coerce")
-    elif 1 <= value <= 100000:
-        parsed = pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce")
-    else:
-        return None
-    return None if pd.isna(parsed) else parsed.normalize()
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _workbook_amount_value(value: object) -> float | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return None if isinstance(value, float) and np.isnan(value) else float(value)
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        number = float(value)
+        return None if np.isnan(number) else number
     text = str(value).strip().replace("\u00a0", "")
     negative = text.startswith("(") and text.endswith(")")
     if negative:
         text = text[1:-1]
-    text = re.sub(r"[,$₹\s]", "", text)
+    text = re.sub(r"[,₹$\s]", "", text)
     if text.endswith("-"):
         text = f"-{text[:-1]}"
     try:
         amount = float(text)
-    except (TypeError, ValueError):
+    except ValueError:
         return None
     return -amount if negative else amount
 
 
-def _excel_value(value: object):
+def _excel_value(value: object) -> object:
     if value is None:
         return None
     if isinstance(value, np.generic):
         value = value.item()
-    if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
-    if isinstance(value, (datetime, date, str, int, float, bool)):
-        if isinstance(value, float) and pd.isna(value):
-            return None
-        return value
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
+    if isinstance(value, float) and np.isnan(value):
+        return None
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value)
+    if isinstance(value, (datetime, date, str, int, float, bool)):
+        return value
     return str(value)
